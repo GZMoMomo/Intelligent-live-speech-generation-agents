@@ -1,0 +1,215 @@
+:root {
+    --live-width: 360px;
+    --live-height: 640px;
+    --message-bg: rgba(255, 255, 255, 0.9);
+    --primary-text: #333;
+    --border-color: #e5e5e5;
+}
+
+.main-container {
+    height: 100vh;
+    background-color: #ffffff;
+    padding: 0;
+    overflow: hidden;
+}
+
+.row {
+    height: 100%;
+    margin: 0;
+}
+
+/* 左右侧面板样式 */
+.side-panel {
+    height: 100%;
+    padding: 2rem 1rem;
+}
+
+.stats-container {
+    background: #ffffff !important;
+    border: 1px solid var(--border-color);
+    height: 100%;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+    border-radius: 12px;
+    padding: 1.5rem;
+}
+
+/* 中间内容区域 */
+.col-lg-4 {
+    height: 100%;
+    padding: 0 1rem;
+    display: flex;
+    flex-direction: column;
+}
+
+/* 上下统计区域样式 */
+.top-stats, .bottom-stats {
+    background: #ffffff !important;
+    border: 1px solid var(--border-color);
+    width: 90%;
+    margin: 0 auto;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+    border-radius: 12px;
+    padding: 0.8rem;
+}
+
+.top-stats {
+    margin-top: 1rem;
+}
+
+.bottom-stats {
+    margin-bottom: 1rem;
+    height: auto; /* 自动调整高度 */
+    min-height: 60px; /* 最小高度 */
+}
+
+/* 视频区域样式 */
+.live-viewport-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    position: relative;
+    flex-grow: 1; /* 占据剩余空间 */
+    margin: 1rem 0;
+}
+
+.live-viewport {
+    width: var(--live-width);
+    height: var(--live-height);
+    max-width: 100%;
+    max-height: 100%;
+    background: #ffffff;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.player-wrapper {
+    width: 100%;
+    height: 100%;
+    position: relative;
+}
+
+/* 消息通知样式 */
+.messages-overlay {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    width: 200px;
+    max-height: 200px; /* 设置固定最大高度 */
+    background: var(--message-bg);
+    border-radius: 8px;
+    padding: 8px;
+    overflow-y: auto; /* 允许垂直滚动 */
+    z-index: 1000; /* 确保显示在视频上层 */
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border: 1px solid var(--border-color);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.message-item {
+    color: var(--primary-text);
+    font-size: 0.8rem;
+    line-height: 1.3;
+    padding: 6px 8px;
+    border-radius: 6px;
+    animation: messageIn 0.3s ease;
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--border-color);
+}
+
+.message-icon {
+    font-size: 0.9rem;
+    flex-shrink: 0;
+}
+
+.message-text {
+    word-break: break-word;
+}
+
+.placeholder-text {
+    color: #666;
+    font-size: 0.9rem;
+    text-align: center;
+}
+
+@keyframes messageIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* 响应式调整 */
+@media (max-width: 1600px) {
+    :root {
+        --live-width: 320px;
+        --live-height: 568px;
+    }
+}
+
+@media (max-width: 1200px) {
+    :root {
+        --live-width: 280px;
+        --live-height: 497px;
+    }
+
+    .messages-overlay {
+        width: 180px;
+    }
+}
+
+@media (max-width: 992px) {
+    .side-panel {
+        height: auto;
+        margin-bottom: 1rem;
+    }
+
+    .stats-container {
+        height: 200px;
+    }
+
+    .live-viewport-container {
+        height: auto;
+        min-height: 400px;
+    }
+}
+
+.message-item {
+    background: rgba(255, 255, 255, 0.9);
+    margin-bottom: 4px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.4;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    animation: messageIn 0.3s ease;
+}
+
+/* 美化滚动条 */
+.messages-overlay::-webkit-scrollbar {
+    width: 4px;
+}
+
+.messages-overlay::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.messages-overlay::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 2px;
+}

@@ -472,7 +472,7 @@ def call_dashscope_api(action_info, user_tag,user_id):
             },
             "parameters": {}
         }
-        print(payload)
+        
         response = requests.post(
             'https://dashscope.aliyuncs.com/api/v1/apps/393153a22dfe46b79c3826fec8d4c534/completion',
             json=payload,  # 使用字典自动序列化
