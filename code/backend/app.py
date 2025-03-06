@@ -15,6 +15,8 @@ from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from collections import Counter, defaultdict
+from dashscope import Application
+from http import HTTPStatus
 
 app = Flask(__name__)
 CORS(app)
@@ -53,6 +55,18 @@ POOL = PooledDB(
     maxconnections=10,
     **DB_CONFIG
 )
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        from decimal import Decimal
+        import math
+        
+        if isinstance(obj, Decimal):
+            return float(obj)
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+        return super().default(obj)
 
 # 添加SSE事件处理器
 class MessageAnnouncer:
@@ -107,11 +121,83 @@ class LiveRoomStats:
     def __init__(self):
         self.lock = Lock()
         self.reset_stats()
+        # 添加script_id属性，默认值为42
+        self.script_id = 42
+        # 添加API调用锁和状态标志
+        self.api_lock = Lock()
+        self.api_in_progress = False
         
         # 启动定时任务，计算变化率
         self.rate_calculation_thread = Thread(target=self._calculate_rates, daemon=True)
         self.rate_calculation_thread.start()
-    
+
+    def _call_dashscope_api(self, recommendation):
+        """调用DashScope API的异步方法，带有锁控制"""
+        stream_id = str(uuid.uuid4())  # 生成唯一流ID
+        with self.api_lock:
+            if self.api_in_progress:
+                app.logger.info("API调用已跳过，前一个调用仍在进行中")
+                return
+            self.api_in_progress = True
+        
+        def async_task():
+            try:
+                # 使用实例的script_id属性，如果未设置则使用默认值42
+                script_id = getattr(self, 'script_id', 42)
+                
+                biz_params = {
+                        "script_id": script_id,
+                        "broadcast_data": recommendation  
+                }
+                
+                response = Application.call(
+                    api_key="sk-5825867b9f004646a7dd9aefd5623aaf",
+                    app_id='55cd461035e542999192f90432743a73',
+                    prompt='(请根据当前直播间实时情况和预设话术生成话术推荐)',
+                    biz_params=biz_params,
+                    incremental_output=True,
+                    flow_stream_mode="agent_format",
+                    stream=True
+                )
+
+                # 处理流式响应
+                for chunk in response:
+                    if chunk.status_code == HTTPStatus.OK:
+                        event_data = {
+                            "type": "script_recommendation",
+                            "stream_id": stream_id,
+                            "data": chunk.output.text,
+                            "script_id": script_id,
+                            "original_recommendation": recommendation,
+                            "is_end": False  # 添加结束标记
+                        }
+                        sse_message = f"event: script_recommendation\ndata: {json.dumps(event_data)}\n\n"
+                        announcer.announce(sse_message)
+                    else:
+                        app.logger.error(f"API Error: {chunk.message}")
+
+                # 添加结束标记
+                event_data = {
+                    "type": "script_recommendation",
+                    "data": "",
+                    "script_id": script_id,
+                    "original_recommendation": recommendation,
+                    "is_end": True
+                }
+                sse_message = f"event: script_recommendation\ndata: {json.dumps(event_data)}\n\n"
+                announcer.announce(sse_message)
+            except Exception as e:
+                app.logger.error(f"API调用异常: {str(e)}")
+            finally:
+                event_data["is_end"] = True
+                event_data["stream_id"] = stream_id
+                # 确保无论如何都会重置API状态
+                with self.api_lock:
+                    self.api_in_progress = False
+                
+        # 提交到线程池执行
+        executor.submit(async_task)
+
     def reset_stats(self):
         """重置所有统计数据"""
         with self.lock:
@@ -144,7 +230,7 @@ class LiveRoomStats:
     def _calculate_rates(self):
         """后台线程：计算各种变化率"""
         while True:
-            time.sleep(30)  # 每30秒计算一次
+            time.sleep(2)  # 每2秒计算一次
             with self.lock:
                 # 计算流量变化率
                 if len(self.traffic_history) >= 2:
@@ -245,7 +331,7 @@ class LiveRoomStats:
                     categories = user_profile['behavior'].get('preferred_categories', [])
                     for category in categories:
                         if category:
-                            self.user_tags[f'偏好_{category}'] += 1
+                            self.user_tags[f'偏好类别_{category}'] += 1
                 
                 # 分析流量来源
                 if 'basic' in user_profile and user_profile['basic'].get('registration'):
@@ -257,13 +343,21 @@ class LiveRoomStats:
         """从文本中提取关键词"""
         if not text:
             return []
-            
-        # 简单实现：按空格分词并过滤常见词
-        common_words = {'这个', '有没有', '什么', '怎么', '可以', '吗', '啊', '呢', '的', '了', '是', '我', '你', '他', '她', '它', '们'}
-        words = [w for w in text.split() if w not in common_words and len(w) > 1]
         
-        # 返回所有可能的关键词
-        return words
+        # 使用结巴分词作为基础分词器
+        import jieba
+        
+        # 停用词列表 - 常见的无意义词汇
+        stop_words = {'这个', '有没有', '什么', '怎么', '可以', '吗', '啊', '呢', '的', '了', '是', '我', '你', '他', '她', '它', '们',
+                    '和', '与', '以', '及', '或', '那个', '这些', '那些', '如何', '为什么', '怎样', '一个', '没有', '不是', '就是'}
+        
+        # 使用结巴分词进行分词
+        words = jieba.cut(text)
+        
+        # 过滤停用词和单字词
+        keywords = [word for word in words if word not in stop_words and len(word) > 1]
+        
+        return keywords
     
     def get_stats(self):
         """获取当前统计数据"""
@@ -276,7 +370,7 @@ class LiveRoomStats:
             old_customer_ratio = len(old_customers) / len(self.current_users) if self.current_users else 0
             
             long_stay_users = [uid for uid, duration in self.stay_duration.items() 
-                              if duration >= 300 and uid in self.current_users]  # 停留超过5分钟的用户
+                            if duration >= 300 and uid in self.current_users]  # 停留超过5分钟的用户
             long_stay_ratio = len(long_stay_users) / len(self.current_users) if self.current_users else 0
             
             # 构建统计结果
@@ -307,6 +401,382 @@ class LiveRoomStats:
                 'traffic_timestamps': [ts.isoformat() for ts in self.traffic_timestamps[-10:]]
             }
             
+            # 从数据库获取用户画像统计数据
+            try:
+                conn = POOL.connection()
+                with conn.cursor() as cursor:
+                    # 执行你提供的SQL查询
+                    cursor.execute("""
+                    WITH current_users AS (
+                        SELECT
+                            e.user_id 
+                        FROM
+                            bailian_data_liveinteractions e 
+                        WHERE
+                            e.behavior_type = 'enter' 
+                            AND NOT EXISTS (SELECT 1 FROM bailian_data_liveinteractions ex WHERE ex.user_id = e.user_id AND ex.behavior_type = 'exit' AND ex.event_time > e.event_time) 
+                        GROUP BY
+                    e.user_id) SELECT-- 性别比例统计
+                    ROUND(SUM(CASE WHEN gender = '1' THEN 1 ELSE 0 END) / COUNT(*) * 100, 2) AS male_percentage,
+                    ROUND(SUM(CASE WHEN gender = '2' THEN 1 ELSE 0 END) / COUNT(*) * 100, 2) AS female_percentage,-- 平均年龄
+                    ROUND(AVG(age), 2) AS average_age,-- 会员等级分布
+                    (
+                        SELECT
+                            member_level 
+                        FROM
+                            (
+                                SELECT
+                                    member_level,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    member_level IS NOT NULL 
+                                GROUP BY
+                                    member_level 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_member) AS top_member_level,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    member_level,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    member_level IS NOT NULL 
+                                GROUP BY
+                                    member_level 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_member_count) AS top_member_level_count,-- 其他统计指标，以相同方式修改
+                    ROUND(AVG(avg_spending), 2) AS average_spending,
+                    ROUND(AVG(discount_sensitivity), 2) AS average_discount_sensitivity,-- 品类偏好TOP1及数量
+                    (
+                        SELECT
+                            categoryPreference 
+                        FROM
+                            (
+                                SELECT
+                                    categoryPreference,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    categoryPreference IS NOT NULL 
+                                GROUP BY
+                                    categoryPreference 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_category) AS top_category_preference,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    categoryPreference,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    categoryPreference IS NOT NULL 
+                                GROUP BY
+                                    categoryPreference 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_category_count) AS top_category_preference_count,-- 评论情感倾向TOP1及数量
+                    (
+                        SELECT
+                            commentSentiment 
+                        FROM
+                            (
+                                SELECT
+                                    commentSentiment,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    commentSentiment IS NOT NULL 
+                                GROUP BY
+                                    commentSentiment 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_sentiment) AS top_comment_sentiment,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    commentSentiment,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    commentSentiment IS NOT NULL 
+                                GROUP BY
+                                    commentSentiment 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_sentiment_count) AS top_comment_sentiment_count,-- 生活方式推断TOP1及数量
+                    (
+                        SELECT
+                            lifestyleInference 
+                        FROM
+                            (
+                                SELECT
+                                    lifestyleInference,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    lifestyleInference IS NOT NULL 
+                                GROUP BY
+                                    lifestyleInference 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_lifestyle) AS top_lifestyle_inference,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    lifestyleInference,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    lifestyleInference IS NOT NULL 
+                                GROUP BY
+                                    lifestyleInference 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_lifestyle_count) AS top_lifestyle_inference_count,-- 需求识别TOP1及数量
+                    (
+                        SELECT
+                            demandIdentification 
+                        FROM
+                            (
+                                SELECT
+                                    demandIdentification,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    demandIdentification IS NOT NULL 
+                                GROUP BY
+                                    demandIdentification 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_demand) AS top_demand_identification,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    demandIdentification,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    demandIdentification IS NOT NULL 
+                                GROUP BY
+                                    demandIdentification 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_demand_count) AS top_demand_identification_count,-- 性格特征分析TOP1及数量
+                    (
+                        SELECT
+                            personalityAnalysis 
+                        FROM
+                            (
+                                SELECT
+                                    personalityAnalysis,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    personalityAnalysis IS NOT NULL 
+                                GROUP BY
+                                    personalityAnalysis 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_personality) AS top_personality_analysis,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    personalityAnalysis,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    personalityAnalysis IS NOT NULL 
+                                GROUP BY
+                                    personalityAnalysis 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_personality_count) AS top_personality_analysis_count,-- 购买决策模式TOP1及数量
+                    (
+                        SELECT
+                            purchaseDecisionPattern 
+                        FROM
+                            (
+                                SELECT
+                                    purchaseDecisionPattern,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    purchaseDecisionPattern IS NOT NULL 
+                                GROUP BY
+                                    purchaseDecisionPattern 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_purchase) AS top_purchase_decision_pattern,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    purchaseDecisionPattern,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    purchaseDecisionPattern IS NOT NULL 
+                                GROUP BY
+                                    purchaseDecisionPattern 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_purchase_count) AS top_purchase_decision_pattern_count,-- 价格承受度预测TOP1及数量
+                    (
+                        SELECT
+                            priceToleranceLevel 
+                        FROM
+                            (
+                                SELECT
+                                    priceToleranceLevel,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    priceToleranceLevel IS NOT NULL 
+                                GROUP BY
+                                    priceToleranceLevel 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_price) AS top_price_tolerance_level,
+                    (
+                        SELECT
+                            count 
+                        FROM
+                            (
+                                SELECT
+                                    priceToleranceLevel,
+                                    COUNT(*) AS count 
+                                FROM
+                                    bailian_data_userprofiles u
+                                    INNER JOIN current_users c ON u.user_id = c.user_id 
+                                WHERE
+                                    priceToleranceLevel IS NOT NULL 
+                                GROUP BY
+                                    priceToleranceLevel 
+                                ORDER BY
+                                    count DESC 
+                            LIMIT 1) AS top_price_count) AS top_price_tolerance_level_count 
+                    FROM
+                        bailian_data_userprofiles u
+                        INNER JOIN current_users c ON u.user_id = c.user_id;
+                    """)
+                    
+                    user_profile_stats = cursor.fetchone()
+                    
+                    if user_profile_stats:
+                            # 处理所有可能的NaN值
+                        for key in list(user_profile_stats.keys()):
+                            value = user_profile_stats[key]
+                            if isinstance(value, float):
+                                if math.isnan(value):
+                                    user_profile_stats[key] = None
+                                elif math.isinf(value):
+                                    user_profile_stats[key] = None
+                        # 添加用户画像统计数据到结果中
+                        stats.update({
+                            # 性别比例
+                            'male_percentage': user_profile_stats.get('male_percentage', 0),
+                            'female_percentage': user_profile_stats.get('female_percentage', 0),
+                            
+                            # 平均年龄
+                            'average_age': user_profile_stats.get('average_age', 0),
+                            
+                            # 会员等级分布
+                            'top_member_level': user_profile_stats.get('top_member_level'),
+                            'top_member_level_count': user_profile_stats.get('top_member_level_count', 0),
+                            
+                            # 消费能力
+                            'average_spending': user_profile_stats.get('average_spending', 0),
+                            'average_discount_sensitivity': user_profile_stats.get('average_discount_sensitivity', 0),
+                            
+                            # 品类偏好
+                            'top_category_preference': user_profile_stats.get('top_category_preference'),
+                            'top_category_preference_count': user_profile_stats.get('top_category_preference_count', 0),
+                            
+                            # 评论情感倾向
+                            'top_comment_sentiment': user_profile_stats.get('top_comment_sentiment'),
+                            'top_comment_sentiment_count': user_profile_stats.get('top_comment_sentiment_count', 0),
+                            
+                            # 生活方式推断
+                            'top_lifestyle_inference': user_profile_stats.get('top_lifestyle_inference'),
+                            'top_lifestyle_inference_count': user_profile_stats.get('top_lifestyle_inference_count', 0),
+                            
+                            # 需求识别
+                            'top_demand_identification': user_profile_stats.get('top_demand_identification'),
+                            'top_demand_identification_count': user_profile_stats.get('top_demand_identification_count', 0),
+                            
+                            # 性格特征分析
+                            'top_personality_analysis': user_profile_stats.get('top_personality_analysis'),
+                            'top_personality_analysis_count': user_profile_stats.get('top_personality_analysis_count', 0),
+                            
+                            # 购买决策模式
+                            'top_purchase_decision_pattern': user_profile_stats.get('top_purchase_decision_pattern'),
+                            'top_purchase_decision_pattern_count': user_profile_stats.get('top_purchase_decision_pattern_count', 0),
+                            
+                            # 价格承受度预测
+                            'top_price_tolerance_level': user_profile_stats.get('top_price_tolerance_level'),
+                            'top_price_tolerance_level_count': user_profile_stats.get('top_price_tolerance_level_count', 0)
+                        })
+            except Exception as e:
+                app.logger.error(f"Error fetching user profile statistics: {str(e)}")
+            finally:
+                if 'conn' in locals():
+                    conn.close()
+            
             # 生成话术推荐
             stats['script_recommendations'] = self._generate_recommendations(stats)
             
@@ -318,27 +788,52 @@ class LiveRoomStats:
         
         # 根据用户构成推荐
         if stats['guest_users'] > stats['registered_users'] * 2:
-            recommendations.append("游客占比高，建议增加品牌介绍和会员福利引导")
+            rec = "游客占比高，建议增加品牌介绍和会员福利引导"
+            recommendations.append(rec)
+            self._call_dashscope_api(rec)
         
         # 根据互动情况推荐
-        if stats['total_comments'] > 0 and stats['total_likes'] / stats['total_comments'] < 2:
-            recommendations.append("评论活跃但点赞较少，建议增加互动引导和点赞激励")
+        elif stats['total_comments'] > 0 and stats['total_likes'] / stats['total_comments'] < 2:
+            rec = "评论活跃但点赞较少，建议增加互动引导和点赞激励"
+            recommendations.append(rec)
+            self._call_dashscope_api(rec)
         
         # 根据用户兴趣推荐
-        if stats['user_interests']:
+        elif stats['user_interests']:
             top_interest = list(stats['user_interests'].keys())[0] if stats['user_interests'] else None
             if top_interest:
-                recommendations.append(f"用户关注'{top_interest}'较多，建议围绕此话题展开介绍")
+                rec = f"用户关注'{top_interest}'较多，建议围绕此话题展开介绍"
+                recommendations.append(rec)
+                self._call_dashscope_api(rec)
         
         # 根据流量变化推荐
-        if stats['traffic_rate'] < -2:  # 每分钟减少2人以上
-            recommendations.append("用户流失率较高，建议推出限时优惠或展示爆款商品")
+        elif stats['traffic_rate'] < -2:
+            rec = "用户流失率较高，建议推出限时优惠或展示爆款商品"
+            recommendations.append(rec)
+            self._call_dashscope_api(rec)
         
         # 根据停留时长推荐
-        if stats['long_stay_ratio'] > 50 and stats['old_customer_ratio'] > 50:
-            recommendations.append("老客户占比高且停留时间长，建议介绍新品或会员专享商品")
+        elif stats['long_stay_ratio'] > 50 and stats['old_customer_ratio'] > 50:
+            rec = "老客户占比高且停留时间长，建议介绍新品或会员专享商品"
+            recommendations.append(rec)
+            self._call_dashscope_api(rec)
         
         return recommendations
+
+@app.route('/api/set-script-id', methods=['POST'])
+def set_script_id():
+    data = request.json
+    # 如果没有提供script_id，则使用默认值42
+    script_id = data.get('script_id', 42)
+    
+    # 确保script_id是整数
+    try:
+        script_id = int(script_id)
+    except (ValueError, TypeError):
+        script_id = 42
+    
+    live_room_stats.script_id = script_id
+    return jsonify({'status': 'success', 'script_id': script_id})
 
 # 公共数据预处理模块
 class DataProcessor:
@@ -399,12 +894,12 @@ class DataProcessor:
             self.user_stats[cust_code] = {
                 'common_city': city_mode[0] if len(city_mode) > 0 else None,
                 'median_freq': time_diff.median() if not time_diff.empty else None,
-                'avg_spend': pay_prices[valid_prices].mean() if not pay_prices.empty else 0.0,
+                'avg_spend': pay_prices[valid_prices].mean(skipna=True) if not pay_prices.empty else 0.0,
                 'discount_ratio': discount_count / order_count if order_count > 0 else 0,
                 'top_categories': group['item_cate_l1'].value_counts().head(3).index.tolist()
             }
 
-# 添加到现有代码中
+
 @app.route('/api/live-stats', methods=['GET'])
 def get_live_stats():
     """获取直播间实时统计数据的API端点"""
@@ -416,17 +911,14 @@ def _stats_broadcast_task():
     """定时广播统计数据的后台任务"""
     while True:
         try:
-            # 获取最新统计
             stats = live_room_stats.get_stats()
-            
-            # 推送到SSE
-            announcer.announce(f"event: stats\ndata: {json.dumps(stats)}\n\n")
-            
-            # 每10秒推送一次
-            time.sleep(10)
+            # 使用自定义编码器序列化JSON
+            sse_msg = f"event: stats\ndata: {json.dumps(stats, cls=DecimalEncoder)}\n\n"
+            announcer.announce(sse_msg)
+            time.sleep(2)
         except Exception as e:
-            print(f"Stats broadcast error: {str(e)}")
-            time.sleep(10)  # 出错后等待10秒再试
+            app.logger.error(f"Stats broadcast error: {str(e)}")
+            time.sleep(10)
 
 # 添加重置统计的API
 @app.route('/api/reset-stats', methods=['POST'])

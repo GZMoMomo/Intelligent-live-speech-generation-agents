@@ -6,3 +6,4 @@ openpyxl
 pymysql
 DBUtils
 requests
+jieba

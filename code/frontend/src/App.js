@@ -4,11 +4,14 @@ import ReactPlayer from 'react-player';
 import { Line } from 'react-chartjs-2';
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js';
 import './LiveStreamPage.css';
+import ReactMarkdown from 'react-markdown'; // 引入Markdown渲染组件
+import rehypeRaw from 'rehype-raw'; // 用于支持HTML渲染
 
 // 注册Chart.js组件
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
 const MAX_MESSAGES = 8; // 最多显示8条消息
+const API_BASE_URL = 'http://localhost:5000/api';
 
 const LiveStreamPage = () => {
   const [messages, setMessages] = useState([]);
@@ -25,16 +28,41 @@ const LiveStreamPage = () => {
     traffic_timestamps: [],
     user_tags: {},
     user_interests: {},
-    script_recommendations: []
+    script_recommendations: [],
+    old_customer_ratio: 0,
+    long_stay_ratio: 0,
+    // 新增用户画像统计数据
+    male_percentage: 0,
+    female_percentage: 0,
+    average_age: 0,
+    top_member_level: null,
+    top_member_level_count: 0,
+    average_spending: 0,
+    average_discount_sensitivity: 0,
+    top_category_preference: null,
+    top_category_preference_count: 0,
+    top_comment_sentiment: null,
+    top_comment_sentiment_count: 0,
+    top_lifestyle_inference: null,
+    top_lifestyle_inference_count: 0,
+    top_demand_identification: null,
+    top_demand_identification_count: 0,
+    top_personality_analysis: null,
+    top_personality_analysis_count: 0,
+    top_purchase_decision_pattern: null,
+    top_purchase_decision_pattern_count: 0,
+    top_price_tolerance_level: null,
+    top_price_tolerance_level_count: 0
   });
   const [alerts, setAlerts] = useState([]);
+  const [scriptId, setScriptId] = useState(42); // 默认值为42
+  const [aiResponses, setAiResponses] = useState({}); // 存储AI返回的话术
   const messagesContainerRef = useRef(null);
   const eventSourceRef = useRef(null);
-  const statsEventSourceRef = useRef(null);
 
   useEffect(() => {
     // 启动后端批量任务
-    fetch('http://localhost:5000/api/batch-control', {
+    fetch(`${API_BASE_URL}/batch-control`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -44,12 +72,21 @@ const LiveStreamPage = () => {
       }),
     });
 
-    // 建立SSE连接 - 用户互动
-    eventSourceRef.current = new EventSource('http://localhost:5000/api/stream');
+    // 设置script_id
+    fetch(`${API_BASE_URL}/set-script-id`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script_id: scriptId }),
+    });
+
+    // 建立SSE连接
+    eventSourceRef.current = new EventSource(`${API_BASE_URL}/stream`);
     
+    // 用户互动事件处理
     eventSourceRef.current.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data);
+        const sanitizedData = event.data.replace(/: ?NaN/g, ': null')
+        const data = JSON.parse(sanitizedData);
         const { live_interaction, user_profile } = data;
         
         if (!live_interaction) return;
@@ -104,41 +141,101 @@ const LiveStreamPage = () => {
       }
     };
     
-    // 建立SSE连接 - 统计数据
-    statsEventSourceRef.current = new EventSource('http://localhost:5000/api/stream');
-    
-    statsEventSourceRef.current.addEventListener('stats', (event) => {
+    // 添加对stats事件的监听
+    eventSourceRef.current.addEventListener('stats', (event) => {
       try {
-        const stats = JSON.parse(event.data);
-        setLiveStats(stats);
+        const data = JSON.parse(event.data);
+        setLiveStats(data);
       } catch (error) {
         console.error('Error parsing stats data:', error);
       }
     });
+
+    // 添加对script_recommendation事件的监听
+    eventSourceRef.current.addEventListener('script_recommendation', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        setAiResponses(prev => {
+          const streamId = data.stream_id;  // 使用后端生成的流ID
+          const original = data.original_recommendation;
+      
+          return {
+            ...prev,
+            [original]: {
+              streamId,  // 存储流ID用于key生成
+              text: (prev[original]?.text || '') + (data.data || ''),
+              complete: data.is_end
+            }
+          };
+        });
+
+        console.log('收到script_recommendation事件:', data); // 添加日志
+        
+        // 确保有必要的字段
+        if (!data.original_recommendation) {
+          console.error('缺少original_recommendation字段:', data);
+          return;
+        }
+        
+        setAiResponses(prev => {
+          const originalRecommendation = data.original_recommendation;
+          const currentText = prev[originalRecommendation]?.text || '';
+          const isComplete = data.is_end || false;
+          const newText = isComplete ? currentText : currentText + (data.data || '');
+          
+          console.log(`更新话术 [${originalRecommendation}]: ${newText}`);
+          
+          return {
+            ...prev,
+            [originalRecommendation]: {
+              text: newText,
+              complete: isComplete
+            }
+          };
+        });
+      } catch (error) {
+        console.error('Error parsing script recommendation data:', error);
+      }
+    });
+    
     
     // 定期获取警报信息
     const alertsInterval = setInterval(() => {
-      fetch('http://localhost:5000/api/alert-conditions')
+      fetch(`${API_BASE_URL}/alert-conditions`)
         .then(res => res.json())
         .then(data => {
           setAlerts(data.alerts);
         })
         .catch(err => console.error('Error fetching alerts:', err));
-    }, 15000);
+    }, 2000);
 
     return () => {
       eventSourceRef.current?.close();
-      statsEventSourceRef.current?.close();
       clearInterval(alertsInterval);
       
-      fetch('http://localhost:5000/api/batch-control', {
+      fetch(`${API_BASE_URL}/batch-control`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'stop' }),
       });
     };
-  }, []);
+  }, [scriptId]); // 添加scriptId作为依赖项
 
+  // 当scriptId变更时，更新后端设置
+  const handleScriptIdChange = (e) => {
+    const newId = parseInt(e.target.value) || 42; // 如果无法解析为整数，则使用默认值42
+    setScriptId(newId);
+    
+    // 发送到后端
+    fetch(`${API_BASE_URL}/set-script-id`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ script_id: newId }),
+    });
+  };
+
+  // 自动滚动消息到底部
   useEffect(() => {
     if (messagesContainerRef.current) {
       messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
@@ -213,16 +310,103 @@ const LiveStreamPage = () => {
       </div>
     ));
   };
-  
-  // 话术推荐渲染
+
+  // 简单哈希函数（生产环境建议使用更复杂算法）
+  const hashCode = str => {
+    let hash = 0;
+    if (str.length === 0) return hash;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash |= 0; // 转换为32位整数
+    }
+    return hash;
+  };
+
+  // 话术推荐渲染 
   const renderScriptRecommendations = () => {
     const recommendations = liveStats.script_recommendations || [];
-    return recommendations.map((rec, index) => (
-      <div key={index} className="recommendation-item">
-        <div className="recommendation-number">{index + 1}</div>
-        <div className="recommendation-text">{rec}</div>
+    
+    // 添加日志，帮助调试
+    console.log('话术推荐列表:', recommendations);
+    console.log('AI响应状态:', aiResponses);
+    
+    if (recommendations.length === 0) {
+      // 检查aiResponses是否有内容
+      const aiResponseKeys = Object.keys(aiResponses);
+      if (aiResponseKeys.length > 0) {
+        // 如果有AI响应但没有推荐列表，使用AI响应的键作为推荐列表
+        return (
+          <div className="recommendations-scroll-container">
+            {recommendations.map((rec, index) => {
+              const aiData = aiResponses[rec] || { text: '', complete: false };
+              // 生成唯一 key 的三种策略（按优先级降序）
+              const key = 
+                // 策略一：优先使用后端生成的唯一标识（需要后端支持）
+                aiResponses[rec]?.streamId || 
+                // 策略二：使用特征哈希（推荐即时方案）
+                `rec-${hashCode(rec)}-${scriptId}` ||
+                // 策略三：降级方案（时间戳+随机数）
+                `rec-fallback-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+
+              return (
+                <div key={key} className="recommendation-item">
+                  <div className="recommendation-number">{index + 1}</div>
+                  <div className="recommendation-text">
+                    <div className="original-recommendation">{rec}</div>
+                    {aiData.text && (
+                      <div className="ai-recommendation">
+                        <div className="ai-badge">AI话术:</div>
+                        <div className="ai-text-container">
+                          <ReactMarkdown rehypePlugins={[rehypeRaw]}>
+                            {aiData.text}
+                          </ReactMarkdown>
+                          {!aiData.complete && <span className="typing-cursor">|</span>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      }
+      
+      return (
+        <div className="empty-recommendations">
+          <p>暂无话术推荐</p>
+        </div>
+      );
+    }
+    
+    return (
+      <div className="recommendations-scroll-container">
+        {recommendations.map((rec, index) => {
+          const aiData = aiResponses[rec] || { text: '', complete: false };
+          
+          return (
+            <div key={`recommendation-${index}-${rec}`} className="recommendation-item">
+              <div className="recommendation-number">{index + 1}</div>
+              <div className="recommendation-text">
+                <div className="original-recommendation">{rec}</div>
+                {aiData.text && (
+                  <div className="ai-recommendation">
+                    <div className="ai-badge">AI话术:</div>
+                    <div className="ai-text-container">
+                      <ReactMarkdown rehypePlugins={[rehypeRaw]}>
+                        {aiData.text}
+                      </ReactMarkdown>
+                      {!aiData.complete && <span className="typing-cursor">|</span>}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
       </div>
-    ));
+    );
   };
   
   // 警报渲染
@@ -320,6 +504,123 @@ const LiveStreamPage = () => {
               </div>
             </div>
             
+            <div className="user-profile-stats mb-4">
+              <h5>用户画像统计</h5>
+              
+              {/* 性别比例 */}
+              <div className="profile-stat-item mb-3">
+                <h6>性别比例</h6>
+                <div className="progress" style={{ height: '20px' }}>
+                  <div 
+                    className="progress-bar bg-primary" 
+                    role="progressbar" 
+                    style={{ width: `${liveStats.male_percentage || 0}%` }}
+                    aria-valuenow={liveStats.male_percentage || 0} 
+                    aria-valuemin="0" 
+                    aria-valuemax="100">
+                    男 {Math.round(liveStats.male_percentage || 0)}%
+                  </div>
+                  <div 
+                    className="progress-bar bg-danger" 
+                    role="progressbar" 
+                    style={{ width: `${liveStats.female_percentage || 0}%` }}
+                    aria-valuenow={liveStats.female_percentage || 0} 
+                    aria-valuemin="0" 
+                    aria-valuemax="100">
+                    女 {Math.round(liveStats.female_percentage || 0)}%
+                  </div>
+                </div>
+              </div>
+              
+              {/* 年龄和消费能力 */}
+              <div className="profile-stats-row d-flex justify-content-between mb-3">
+                <div className="profile-stat-card">
+                  <div className="stat-title">平均年龄</div>
+                  <div className="stat-value">{liveStats.average_age?.toFixed(1) || '未知'}</div>
+                </div>
+                <div className="profile-stat-card">
+                  <div className="stat-title">平均消费</div>
+                  <div className="stat-value">¥{liveStats.average_spending?.toFixed(0) || 0}</div>
+                </div>
+                <div className="profile-stat-card">
+                  <div className="stat-title">折扣敏感度</div>
+                  <div className="stat-value">{liveStats.average_discount_sensitivity?.toFixed(1) || 0}%</div>
+                </div>
+              </div>
+              
+              {/* 会员等级和品类偏好 */}
+              <div className="profile-stats-row mb-3">
+                <div className="d-flex justify-content-between">
+                  <div className="profile-stat-tag">
+                    <span className="stat-label">主要会员等级:</span>
+                    <span className="stat-badge bg-gold">{liveStats.top_member_level || '未知'}</span>
+                    <span className="stat-count">({liveStats.top_member_level_count || 0}人)</span>
+                  </div>
+                  <div className="profile-stat-tag">
+                    <span className="stat-label">品类偏好:</span>
+                    <span className="stat-badge bg-info">{liveStats.top_category_preference || '未知'}</span>
+                    <span className="stat-count">({liveStats.top_category_preference_count || 0}人)</span>
+                  </div>
+                </div>
+              </div>
+              
+              {/* 用户特征分析 */}
+              <div className="profile-insights mb-2">
+                <h6>用户特征分析</h6>
+                <div className="insights-container">
+                  {liveStats.top_personality_analysis && (
+                    <div className="insight-badge">
+                      <span className="insight-label">性格特征:</span>
+                      <span className="insight-value">{liveStats.top_personality_analysis}</span>
+                      <span className="insight-count">({liveStats.top_personality_analysis_count || 0})</span>
+                    </div>
+                  )}
+                  {liveStats.top_lifestyle_inference && (
+                    <div className="insight-badge">
+                      <span className="insight-label">生活方式:</span>
+                      <span className="insight-value">{liveStats.top_lifestyle_inference}</span>
+                      <span className="insight-count">({liveStats.top_lifestyle_inference_count || 0})</span>
+                    </div>
+                  )}
+                  {liveStats.top_comment_sentiment && (
+                    <div className="insight-badge">
+                      <span className="insight-label">评论情感:</span>
+                      <span className="insight-value">{liveStats.top_comment_sentiment}</span>
+                      <span className="insight-count">({liveStats.top_comment_sentiment_count || 0})</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+              
+              {/* 购买决策分析 */}
+              <div className="purchase-insights">
+                <h6>购买决策分析</h6>
+                <div className="insights-container">
+                  {liveStats.top_demand_identification && (
+                    <div className="insight-badge">
+                      <span className="insight-label">主要需求:</span>
+                      <span className="insight-value">{liveStats.top_demand_identification}</span>
+                      <span className="insight-count">({liveStats.top_demand_identification_count || 0})</span>
+                    </div>
+                  )}
+                  {liveStats.top_purchase_decision_pattern && (
+                    <div className="insight-badge">
+                      <span className="insight-label">决策模式:</span>
+                      <span className="insight-value">{liveStats.top_purchase_decision_pattern}</span>
+                      <span className="insight-count">({liveStats.top_purchase_decision_pattern_count || 0})</span>
+                    </div>
+                  )}
+                  {liveStats.top_price_tolerance_level && (
+                    <div className="insight-badge">
+                      <span className="insight-label">价格承受度:</span>
+                      <span className="insight-value">{liveStats.top_price_tolerance_level}</span>
+                      <span className="insight-count">({liveStats.top_price_tolerance_level_count || 0})</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
             <div className="top-comments">
               <h5>热门评论 TOP3</h5>
               {renderTopComments()}
@@ -334,17 +635,6 @@ const LiveStreamPage = () => {
             <div className="d-flex justify-content-between align-items-center">
               <div className="live-status">
                 <span className="status-indicator"></span> 直播中
-              </div>
-              <div className="live-metrics">
-                <span className="metric-item">
-                  <i className="bi bi-person-fill"></i> {liveStats.current_users}
-                </span>
-                <span className="metric-item">
-                  <i className="bi bi-heart-fill"></i> {liveStats.total_likes}
-                </span>
-                <span className="metric-item">
-                  <i className="bi bi-chat-fill"></i> {liveStats.total_comments}
-                </span>
               </div>
             </div>
             
@@ -378,7 +668,7 @@ const LiveStreamPage = () => {
                   <div key={msg.id} className={`message-item ${msg.type}`}>
                     <span className="message-icon">{msg.icon}</span>
                     <span className="message-text">{msg.text}</span>
-                    {msg.user && !msg.user.basic.gender?.startsWith('游客') && (
+                    {msg.user && (typeof msg.user.basic.gender === 'string' && !msg.user.basic.gender.startsWith('游客')) && (
                       <span className="user-tag">
                         {msg.user.behavior.avg_spending > 5000 ? '💎' : ''}
                         {msg.user.behavior.preferred_categories?.includes('包') ? '👜' : ''}
@@ -418,10 +708,10 @@ const LiveStreamPage = () => {
               </div>
               <div className="engagement-stats">
                 <div className="stat-badge">
-                  <span className="badge bg-info">老客户比例: {liveStats.old_customer_ratio}%</span>
+                  <span className="badge bg-info">注册用户比例: {liveStats.old_customer_ratio}%</span>
                 </div>
                 <div className="stat-badge">
-                  <span className="badge bg-success">长时停留: {liveStats.long_stay_ratio}%</span>
+                  <span className="badge bg-success">5分钟停留: {liveStats.long_stay_ratio}%</span>
                 </div>
               </div>
             </div>
@@ -433,6 +723,23 @@ const LiveStreamPage = () => {
           <div className="stats-container h-100 bg-light rounded-3 p-3">
             <h4 className="stats-header">主播话术建议</h4>
             
+            {/* 添加script_id输入框 */}
+            <div className="script-id-container mb-3">
+              <label htmlFor="scriptId" className="form-label">话术模板ID:</label>
+              <div className="input-group">
+                <input 
+                  type="number" 
+                  className="form-control" 
+                  id="scriptId" 
+                  value={scriptId}
+                  onChange={handleScriptIdChange}
+                  placeholder="输入话术模板ID"
+                />
+                <span className="input-group-text">当前ID: {scriptId}</span>
+              </div>
+              <small className="form-text text-muted">不填写则使用默认模板(ID:42)</small>
+            </div>
+            
             <div className="script-recommendations mb-4">
               <h5>实时话术推荐</h5>
               <div className="recommendations-container">
@@ -442,20 +749,6 @@ const LiveStreamPage = () => {
             
             <div className="audience-insights mb-4">
               <h5>用户需求洞察</h5>
-              <div className="insight-item">
-                <div className="insight-icon">🔍</div>
-                <div className="insight-content">
-                  <h6>热门关键词</h6>
-                  <div className="keywords-container">
-                    {Object.entries(liveStats.user_interests || {}).slice(0, 3).map(([keyword, count], idx) => (
-                      <div key={idx} className="keyword-item">
-                        <span className="keyword">{keyword}</span>
-                        <span className="keyword-count">{count}次</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
               
               <div className="insight-item">
                 <div className="insight-icon">👥</div>
@@ -471,6 +764,31 @@ const LiveStreamPage = () => {
                     {Object.entries(liveStats.user_tags || {}).slice(0, 2).map(([tag, count], idx) => (
                       <li key={idx}>{tag}用户较多 ({count}人)</li>
                     ))}
+                  </ul>
+                </div>
+              </div>
+              
+              {/* 新增用户画像洞察 */}
+              <div className="insight-item mt-3">
+                <div className="insight-icon">📊</div>
+                <div className="insight-content">
+                  <h6>用户画像洞察</h6>
+                  <ul className="user-traits">
+                    {liveStats.male_percentage > 60 && (
+                      <li>男性用户占主导 ({Math.round(liveStats.male_percentage)}%)</li>
+                    )}
+                    {liveStats.female_percentage > 60 && (
+                      <li>女性用户占主导 ({Math.round(liveStats.female_percentage)}%)</li>
+                    )}
+                    {liveStats.average_age > 0 && (
+                      <li>平均年龄 {liveStats.average_age.toFixed(1)} 岁</li>
+                    )}
+                    {liveStats.top_personality_analysis && (
+                      <li>主要性格特征: {liveStats.top_personality_analysis}</li>
+                    )}
+                    {liveStats.top_demand_identification && (
+                      <li>主要需求: {liveStats.top_demand_identification}</li>
+                    )}
                   </ul>
                 </div>
               </div>
@@ -515,6 +833,47 @@ const LiveStreamPage = () => {
                     <div className="strategy-content">
                       <h6>新客户较多</h6>
                       <p>建议强调品牌故事和产品优势</p>
+                    </div>
+                  </div>
+                )}
+                
+                {/* 新增基于用户画像的推荐策略 */}
+                {liveStats.top_price_tolerance_level === '高' && (
+                  <div className="strategy-item">
+                    <div className="strategy-icon">💎</div>
+                    <div className="strategy-content">
+                      <h6>高价格承受度</h6>
+                      <p>建议推荐高端产品，强调品质和稀缺性</p>
+                    </div>
+                  </div>
+                )}
+                
+                {liveStats.top_category_preference && (
+                  <div className="strategy-item">
+                    <div className="strategy-icon">🔍</div>
+                    <div className="strategy-content">
+                      <h6>品类偏好: {liveStats.top_category_preference}</h6>
+                      <p>建议重点推荐该品类商品，满足用户偏好</p>
+                    </div>
+                  </div>
+                )}
+                
+                {liveStats.average_discount_sensitivity > 70 && (
+                  <div className="strategy-item">
+                    <div className="strategy-icon">🏷️</div>
+                    <div className="strategy-content">
+                      <h6>高折扣敏感度</h6>
+                      <p>建议强调折扣力度和限时优惠</p>
+                    </div>
+                  </div>
+                )}
+                
+                {liveStats.top_purchase_decision_pattern && (
+                  <div className="strategy-item">
+                    <div className="strategy-icon">🧠</div>
+                    <div className="strategy-content">
+                      <h6>决策模式: {liveStats.top_purchase_decision_pattern}</h6>
+                      <p>建议根据用户决策模式调整销售话术</p>
                     </div>
                   </div>
                 )}
