@@ -6,7 +6,6 @@ import numpy as np
 import uuid
 import os
 import pymysql.cursors
-from threading import Lock
 from dbutils.pooled_db import PooledDB
 import time
 from threading import Lock, Thread
@@ -15,6 +14,7 @@ from collections import deque
 from flask_cors import CORS
 from concurrent.futures import ThreadPoolExecutor
 import requests
+from collections import Counter, defaultdict
 
 app = Flask(__name__)
 CORS(app)
@@ -102,6 +102,244 @@ def stream():
                 yield msg
     return Response(generate(), mimetype='text/event-stream')
 
+# 直播间统计类
+class LiveRoomStats:
+    def __init__(self):
+        self.lock = Lock()
+        self.reset_stats()
+        
+        # 启动定时任务，计算变化率
+        self.rate_calculation_thread = Thread(target=self._calculate_rates, daemon=True)
+        self.rate_calculation_thread.start()
+    
+    def reset_stats(self):
+        """重置所有统计数据"""
+        with self.lock:
+            # 基础用户统计
+            self.total_users = set()  # 所有进入过直播间的用户
+            self.current_users = set()  # 当前在线用户
+            self.guest_users = set()  # 游客用户
+            self.registered_users = set()  # 注册用户
+            
+            # 互动统计
+            self.total_likes = 0
+            self.total_shares = 0
+            self.comments = []  # 所有评论列表
+            self.comment_counter = Counter()  # 评论计数器
+            
+            # 流量统计
+            self.traffic_history = []  # 流量历史记录
+            self.traffic_timestamps = []  # 对应的时间戳
+            self.traffic_rate = 0.0  # 流量变化率
+            
+            # 高级分析
+            self.traffic_sources = Counter()  # 流量来源
+            self.user_tags = defaultdict(int)  # 用户标签统计
+            self.stay_duration = defaultdict(float)  # 用户停留时长
+            self.user_interests = Counter()  # 用户兴趣关键词
+            
+            # 最近一次更新时间
+            self.last_update = datetime.now()
+    
+    def _calculate_rates(self):
+        """后台线程：计算各种变化率"""
+        while True:
+            time.sleep(30)  # 每30秒计算一次
+            with self.lock:
+                # 计算流量变化率
+                if len(self.traffic_history) >= 2:
+                    # 计算最近10分钟的流量变化率
+                    now = datetime.now()
+                    cutoff_time = now - timedelta(minutes=10)
+                    
+                    # 过滤出10分钟内的数据
+                    recent_data = [(ts, count) for ts, count in zip(self.traffic_timestamps, self.traffic_history) 
+                                  if ts >= cutoff_time]
+                    
+                    if len(recent_data) >= 2:
+                        # 计算线性回归斜率作为变化率
+                        x = [(ts - cutoff_time).total_seconds() for ts, _ in recent_data]
+                        y = [count for _, count in recent_data]
+                        
+                        if len(x) > 1:  # 确保有足够的数据点
+                            slope, _ = np.polyfit(x, y, 1)
+                            self.traffic_rate = slope * 60  # 转换为每分钟变化率
+    
+    def update_stats(self, interaction_data, user_profile=None):
+        """更新统计数据"""
+        with self.lock:
+            user_id = interaction_data.get('user_id', '')
+            behavior = interaction_data.get('interaction', '')
+            timestamp = datetime.fromisoformat(interaction_data.get('timestamp'))
+            comment = interaction_data.get('comment')
+            
+            # 更新最近一次更新时间
+            self.last_update = timestamp
+            
+            # 用户分类处理
+            is_guest = user_id.startswith('游客_')
+            if is_guest:
+                self.guest_users.add(user_id)
+            else:
+                self.registered_users.add(user_id)
+            
+            # 总用户集合
+            self.total_users.add(user_id)
+            
+            # 处理用户行为
+            if behavior == 'enter':
+                self.current_users.add(user_id)
+                
+                # 更新流量历史
+                self.traffic_history.append(len(self.current_users))
+                self.traffic_timestamps.append(timestamp)
+                
+                # 保留最近30个数据点
+                if len(self.traffic_history) > 30:
+                    self.traffic_history.pop(0)
+                    self.traffic_timestamps.pop(0)
+                
+            elif behavior == 'exit':
+                if user_id in self.current_users:
+                    self.current_users.remove(user_id)
+                
+                # 更新流量历史
+                self.traffic_history.append(len(self.current_users))
+                self.traffic_timestamps.append(timestamp)
+                
+            elif behavior == 'like':
+                self.total_likes += 1
+                
+            elif behavior == 'share':
+                self.total_shares += 1
+                
+            elif behavior == 'comment' and comment:
+                self.comments.append({
+                    'user_id': user_id,
+                    'content': comment,
+                    'timestamp': timestamp
+                })
+                self.comment_counter[comment] += 1
+                
+                # 分析评论中的关键词
+                keywords = self._extract_keywords(comment)
+                for kw in keywords:
+                    self.user_interests[kw] += 1
+            
+            # 更新用户停留时长
+            if user_id in self.current_users:
+                stay_duration = interaction_data.get('stay_duration', 0)
+                self.stay_duration[user_id] = stay_duration
+            
+            # 处理用户画像数据
+            if user_profile and not is_guest:
+                # 提取用户标签
+                if 'behavior' in user_profile:
+                    spending = user_profile['behavior'].get('avg_spending', 0)
+                    if spending > 10000:
+                        self.user_tags['高消费'] += 1
+                    elif spending > 5000:
+                        self.user_tags['中高消费'] += 1
+                    
+                    # 分析用户偏好类别
+                    categories = user_profile['behavior'].get('preferred_categories', [])
+                    for category in categories:
+                        if category:
+                            self.user_tags[f'偏好_{category}'] += 1
+                
+                # 分析流量来源
+                if 'basic' in user_profile and user_profile['basic'].get('registration'):
+                    source = user_profile['basic'].get('registration')
+                    if source:
+                        self.traffic_sources[source] += 1
+    
+    def _extract_keywords(self, text):
+        """从文本中提取关键词"""
+        if not text:
+            return []
+            
+        # 简单实现：按空格分词并过滤常见词
+        common_words = {'这个', '有没有', '什么', '怎么', '可以', '吗', '啊', '呢', '的', '了', '是', '我', '你', '他', '她', '它', '们'}
+        words = [w for w in text.split() if w not in common_words and len(w) > 1]
+        
+        # 返回所有可能的关键词
+        return words
+    
+    def get_stats(self):
+        """获取当前统计数据"""
+        with self.lock:
+            # 计算热门评论TOP3
+            top_comments = self.comment_counter.most_common(3)
+            
+            # 计算老客户占比和停留时长
+            old_customers = [uid for uid in self.current_users if not uid.startswith('游客_')]
+            old_customer_ratio = len(old_customers) / len(self.current_users) if self.current_users else 0
+            
+            long_stay_users = [uid for uid, duration in self.stay_duration.items() 
+                              if duration >= 300 and uid in self.current_users]  # 停留超过5分钟的用户
+            long_stay_ratio = len(long_stay_users) / len(self.current_users) if self.current_users else 0
+            
+            # 构建统计结果
+            stats = {
+                # 基础用户指标
+                'total_users_ever': len(self.total_users),
+                'current_users': len(self.current_users),
+                'guest_users': len([u for u in self.current_users if u.startswith('游客_')]),
+                'registered_users': len([u for u in self.current_users if not u.startswith('游客_')]),
+                'total_likes': self.total_likes,
+                'total_shares': self.total_shares,
+                'total_comments': len(self.comments),
+                'top_comments': [{'content': comment, 'count': count} for comment, count in top_comments],
+                'traffic_rate': self.traffic_rate,  # 每分钟变化率
+                
+                # 高级分析指标
+                'traffic_sources': dict(self.traffic_sources.most_common(5)),
+                'user_tags': dict(sorted(self.user_tags.items(), key=lambda x: x[1], reverse=True)[:5]),
+                'old_customer_ratio': round(old_customer_ratio * 100, 2),
+                'long_stay_ratio': round(long_stay_ratio * 100, 2),
+                'user_interests': dict(self.user_interests.most_common(5)),
+                
+                # 时间戳
+                'timestamp': self.last_update.isoformat(),
+                
+                # 实时数据可视化
+                'traffic_history': self.traffic_history[-10:],  # 最近10个数据点
+                'traffic_timestamps': [ts.isoformat() for ts in self.traffic_timestamps[-10:]]
+            }
+            
+            # 生成话术推荐
+            stats['script_recommendations'] = self._generate_recommendations(stats)
+            
+            return stats
+    
+    def _generate_recommendations(self, stats):
+        """根据统计数据生成话术推荐"""
+        recommendations = []
+        
+        # 根据用户构成推荐
+        if stats['guest_users'] > stats['registered_users'] * 2:
+            recommendations.append("游客占比高，建议增加品牌介绍和会员福利引导")
+        
+        # 根据互动情况推荐
+        if stats['total_comments'] > 0 and stats['total_likes'] / stats['total_comments'] < 2:
+            recommendations.append("评论活跃但点赞较少，建议增加互动引导和点赞激励")
+        
+        # 根据用户兴趣推荐
+        if stats['user_interests']:
+            top_interest = list(stats['user_interests'].keys())[0] if stats['user_interests'] else None
+            if top_interest:
+                recommendations.append(f"用户关注'{top_interest}'较多，建议围绕此话题展开介绍")
+        
+        # 根据流量变化推荐
+        if stats['traffic_rate'] < -2:  # 每分钟减少2人以上
+            recommendations.append("用户流失率较高，建议推出限时优惠或展示爆款商品")
+        
+        # 根据停留时长推荐
+        if stats['long_stay_ratio'] > 50 and stats['old_customer_ratio'] > 50:
+            recommendations.append("老客户占比高且停留时间长，建议介绍新品或会员专享商品")
+        
+        return recommendations
+
 # 公共数据预处理模块
 class DataProcessor:
     def __init__(self):
@@ -165,6 +403,90 @@ class DataProcessor:
                 'discount_ratio': discount_count / order_count if order_count > 0 else 0,
                 'top_categories': group['item_cate_l1'].value_counts().head(3).index.tolist()
             }
+
+# 添加到现有代码中
+@app.route('/api/live-stats', methods=['GET'])
+def get_live_stats():
+    """获取直播间实时统计数据的API端点"""
+    stats = live_room_stats.get_stats()
+    return jsonify(stats)
+
+# 添加定时推送统计数据的功能
+def _stats_broadcast_task():
+    """定时广播统计数据的后台任务"""
+    while True:
+        try:
+            # 获取最新统计
+            stats = live_room_stats.get_stats()
+            
+            # 推送到SSE
+            announcer.announce(f"event: stats\ndata: {json.dumps(stats)}\n\n")
+            
+            # 每10秒推送一次
+            time.sleep(10)
+        except Exception as e:
+            print(f"Stats broadcast error: {str(e)}")
+            time.sleep(10)  # 出错后等待10秒再试
+
+# 添加重置统计的API
+@app.route('/api/reset-stats', methods=['POST'])
+def reset_live_stats():
+    """重置直播间统计数据"""
+    live_room_stats.reset_stats()
+    return jsonify({'status': 'success', 'message': 'Statistics have been reset'})
+
+# 添加特定事件检测和提醒功能
+@app.route('/api/alert-conditions', methods=['GET'])
+def get_alert_conditions():
+    """获取当前可能需要注意的直播间状况"""
+    stats = live_room_stats.get_stats()
+    alerts = []
+    
+    # 检测流量突变
+    if abs(stats['traffic_rate']) > 5:  # 每分钟变化超过5人
+        direction = "增加" if stats['traffic_rate'] > 0 else "减少"
+        alerts.append({
+            'type': 'traffic_change',
+            'severity': 'high',
+            'message': f"直播间流量正在快速{direction}，每分钟{abs(stats['traffic_rate']):.1f}人"
+        })
+    
+    # 检测用户兴趣变化
+    if stats['user_interests'] and list(stats['user_interests'].keys())[0] != '':
+        top_interest = list(stats['user_interests'].keys())[0]
+        alerts.append({
+            'type': 'interest_shift',
+            'severity': 'medium',
+            'message': f"用户对'{top_interest}'话题表现出高度兴趣"
+        })
+    
+    # 检测重要客户
+    vip_count = sum(1 for tag, count in stats['user_tags'].items() if '高消费' in tag)
+    if vip_count > 0:
+        alerts.append({
+            'type': 'vip_presence',
+            'severity': 'high',
+            'message': f"当前有{vip_count}位高消费用户在线"
+        })
+    
+    # 检测用户停留情况
+    if stats['long_stay_ratio'] > 70:
+        alerts.append({
+            'type': 'engagement',
+            'severity': 'positive',
+            'message': f"用户参与度高，{stats['long_stay_ratio']}%的用户停留超过5分钟"
+        })
+    
+    return jsonify({
+        'alerts': alerts,
+        'timestamp': datetime.now().isoformat(),
+        'recommendations': stats['script_recommendations']
+    })
+
+# 初始化直播间统计实例
+live_room_stats = LiveRoomStats()
+# 启动统计广播线程
+Thread(target=_stats_broadcast_task, daemon=True).start()
 
 data_processor = DataProcessor()
 
@@ -570,6 +892,9 @@ def _batch_task(iterations):
                         json.dumps(profile_data, ensure_ascii=False).replace('"', r'\"'),
                         user_id
                     )
+            
+            # 更新统计数据
+            live_room_stats.update_stats(live_data, profile_data)
 
             # 推送数据到SSE前检查
             with batch_control['lock']:
@@ -630,6 +955,234 @@ def batch_control_endpoint():
             return jsonify({'status': 'stopped'})
             
         return jsonify({'status': 'invalid_action'}), 400
+
+def generate_script_id():
+    """生成随机的script_id"""
+    return f"script_{uuid.uuid4().hex[:12]}"
+
+@app.route('/api/insert_live_script', methods=['POST'])
+def insert_live_script():
+    try:
+        data = request.json
+        
+        # 生成随机script_id
+        script_id = generate_script_id()
+        
+        # 准备插入主表的数据
+        script_data = {
+            'script_id': script_id,
+            'product_category_name': data.get('product_category').get('name'),
+            'product_positioning': data.get('product_category').get('positioning'),
+            'target_audience': data.get('product_category').get('target_audience'),
+            'script_type': data.get('script_style').get('type'),
+            'script_characteristics': data.get('script_style').get('characteristics'),
+            'script_text': data.get('script_text', '')
+        }
+        
+        # 插入主表
+        sql = """
+        INSERT INTO bailian_data_live_script 
+        (script_id, product_category_name, product_positioning, target_audience, script_type, script_characteristics, script_text)
+        VALUES (%(script_id)s, %(product_category_name)s, %(product_positioning)s, %(target_audience)s, %(script_type)s, %(script_characteristics)s, %(script_text)s)
+        """
+        _execute_sql(sql, script_data)
+        return jsonify({
+            'success': True,
+            'message': 'Live script inserted successfully',
+            'script_id': script_id
+        }), 201
+    
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error inserting live script: {str(e)}'
+        }), 500
+
+@app.route('/api/insert_live_script_content', methods=['POST'])
+def insert_live_script_content():
+    try:
+        data = request.json
+        script_array = data.get('script_array')
+        script_id = data.get('script_id')
+        # 检查script_id是否存在
+        conn = POOL.connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT script_id FROM bailian_data_live_script WHERE script_id = %s", (script_id,))
+            if not cursor.fetchone():
+                return jsonify({
+                    'success': False,
+                    'message': f'script_id {script_id} does not exist in the main table'
+                }), 404
+        
+        # 批量插入内容
+        inserted_count = 0
+        for item in script_array:
+            content_data = {
+                'script_id': script_id,
+                'section_type': item.get('section_type', ''),
+                'original_text': item.get('original_text', ''),
+                'element_tag': item.get('element_tag', ''),
+                'sequence': item.get('sequence', 0)
+            }
+            
+            sql = """
+            INSERT INTO bailian_data_live_script_content 
+            (script_id, section_type, original_text, element_tag, sequence)
+            VALUES (%(script_id)s, %(section_type)s, %(original_text)s, %(element_tag)s, %(sequence)s)
+            """
+            _execute_sql(sql, content_data)
+            inserted_count += 1
+        
+        return jsonify({
+            'success': True,
+            'message': f'Successfully inserted {inserted_count} content items',
+            'script_id': script_id
+        }), 201
+    
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error inserting live script content: {str(e)}'
+        }), 500
+
+@app.route('/api/script_content/stats', methods=['GET'])
+def get_script_content_stats():
+    try:
+        # 从连接池获取连接
+        conn = POOL.connection()
+        cursor = conn.cursor()
+        
+        # SQL查询 - 统计每个sequence下最常见的section_type和element_tag
+        sql = """
+        WITH sequence_stats AS (
+            SELECT 
+                sequence,
+                section_type,
+                element_tag,
+                ROW_NUMBER() OVER (PARTITION BY sequence ORDER BY COUNT(*) DESC) as rn
+            FROM 
+                bailian_data_live_script_content
+            GROUP BY 
+                sequence, section_type, element_tag
+        ),
+        example_texts AS (
+            SELECT 
+                s.sequence,
+                s.section_type,
+                s.element_tag,
+                c.original_text,
+                ROW_NUMBER() OVER (PARTITION BY s.sequence, s.section_type, s.element_tag ORDER BY c.id) as text_rn
+            FROM 
+                sequence_stats s
+            JOIN 
+                bailian_data_live_script_content c
+                ON s.sequence = c.sequence 
+                AND s.section_type = c.section_type 
+                AND (s.element_tag = c.element_tag OR (s.element_tag IS NULL AND c.element_tag IS NULL))
+            WHERE 
+                s.rn = 1
+        )
+        SELECT 
+            s.sequence,
+            s.section_type,
+            s.element_tag,
+            e.original_text as example_text
+        FROM 
+            sequence_stats s
+        JOIN 
+            example_texts e
+            ON s.sequence = e.sequence 
+            AND s.section_type = e.section_type 
+            AND (s.element_tag = e.element_tag OR (s.element_tag IS NULL AND e.element_tag IS NULL))
+        WHERE 
+            s.rn = 1
+            AND e.text_rn = 1
+        ORDER BY 
+            s.sequence;
+        """
+        
+        cursor.execute(sql)
+        results = cursor.fetchall()
+        
+        # 关闭游标和连接
+        cursor.close()
+        conn.close()
+        
+        # 处理结果
+        stats = []
+        for row in results:
+            stats.append({
+                'most_common_section_type': row['section_type'],
+                'most_common_element_tag': row['element_tag'],
+                'sequence': row['sequence'],
+                'example_text': row['example_text']
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'data': stats,
+            'total': len(stats)
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/get_script', methods=['POST'])
+def get_script():
+    try:
+        # 获取请求体中的JSON数据
+        data = request.get_json()
+        
+        # 检查是否提供了script_id
+        if not data or 'script_id' not in data:
+            return jsonify({
+                'status': 'error',
+                'message': 'Missing script_id parameter'
+            }), 400
+        
+        script_id = data['script_id']
+        
+        # 从连接池获取数据库连接
+        conn = POOL.connection()
+        cursor = conn.cursor()
+        
+        try:
+            # 执行查询
+            query = """
+                SELECT script_text 
+                FROM bailian_data_live_script 
+                WHERE id = %s 
+                LIMIT 1
+            """
+            cursor.execute(query, (script_id,))
+            result = cursor.fetchone()
+            
+            if result:
+                return jsonify({
+                    'status': 'success',
+                    'data': result
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'No script found with script_id: {script_id}'
+                }), 404
+                
+        finally:
+            # 关闭游标和连接
+            cursor.close()
+            conn.close()
+            
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+
 
 if __name__ == '__main__':
 
