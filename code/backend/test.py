@@ -19,10 +19,9 @@ def test_dashscope_api_streaming():
         }
         
         response = Application.call(
-            api_key="sk-5825867b9f004646a7dd9aefd5623aaf",
-            app_id='55cd461035e542999192f90432743a73',
+                    api_key="sk-5825867b9f004646a7dd9aefd5623aaf",
+                    app_id='eacfbfcd378c4306bd475b111bc63884',
             prompt='(请根据当前直播间实时情况和预设话术生成话术推荐)',
-            biz_params=biz_params,
             incremental_output=True,
             flow_stream_mode="agent_format",
             stream=True

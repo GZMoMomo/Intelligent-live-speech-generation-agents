@@ -131,6 +131,13 @@ class LiveRoomStats:
         self.rate_calculation_thread = Thread(target=self._calculate_rates, daemon=True)
         self.rate_calculation_thread.start()
 
+        self.current_tag = ""
+
+    def update_recommendation(self, recommendation):
+        """更新推荐字符串并触发 API 调用"""
+        if recommendation != self.current_tag:
+            self.current_tag = recommendation
+
     def _call_dashscope_api(self, recommendation):
         """调用DashScope API的异步方法，带有锁控制"""
         stream_id = str(uuid.uuid4())  # 生成唯一流ID
@@ -153,7 +160,7 @@ class LiveRoomStats:
                 response = Application.call(
                     api_key="sk-5825867b9f004646a7dd9aefd5623aaf",
                     app_id='55cd461035e542999192f90432743a73',
-                    prompt='(请根据当前直播间实时情况和预设话术生成话术推荐)',
+                    prompt=f'{self.current_tag}\n(请根据当前直播间实时情况和预设话术生成话术推荐)',
                     biz_params=biz_params,
                     incremental_output=True,
                     flow_stream_mode="agent_format",
@@ -786,17 +793,21 @@ class LiveRoomStats:
         """根据统计数据生成话术推荐"""
         recommendations = []
         
+        # 将关键统计数据转换为字符串格式
+        stats_summary = self._format_stats_for_api(stats)
+        
         # 根据用户构成推荐
         if stats['guest_users'] > stats['registered_users'] * 2:
             rec = "游客占比高，建议增加品牌介绍和会员福利引导"
             recommendations.append(rec)
-            self._call_dashscope_api(rec)
+            # 将统计数据和推荐一起传递给API
+            self._call_dashscope_api(f"{stats_summary}\n\n{rec}")
         
         # 根据互动情况推荐
         elif stats['total_comments'] > 0 and stats['total_likes'] / stats['total_comments'] < 2:
             rec = "评论活跃但点赞较少，建议增加互动引导和点赞激励"
             recommendations.append(rec)
-            self._call_dashscope_api(rec)
+            self._call_dashscope_api(f"{stats_summary}\n\n{rec}")
         
         # 根据用户兴趣推荐
         elif stats['user_interests']:
@@ -804,21 +815,67 @@ class LiveRoomStats:
             if top_interest:
                 rec = f"用户关注'{top_interest}'较多，建议围绕此话题展开介绍"
                 recommendations.append(rec)
-                self._call_dashscope_api(rec)
+                self._call_dashscope_api(f"{stats_summary}\n\n{rec}")
         
         # 根据流量变化推荐
         elif stats['traffic_rate'] < -2:
             rec = "用户流失率较高，建议推出限时优惠或展示爆款商品"
             recommendations.append(rec)
-            self._call_dashscope_api(rec)
+            self._call_dashscope_api(f"{stats_summary}\n\n{rec}")
         
         # 根据停留时长推荐
         elif stats['long_stay_ratio'] > 50 and stats['old_customer_ratio'] > 50:
             rec = "老客户占比高且停留时间长，建议介绍新品或会员专享商品"
             recommendations.append(rec)
-            self._call_dashscope_api(rec)
+            self._call_dashscope_api(f"{stats_summary}\n\n{rec}")
         
         return recommendations
+
+    def _format_stats_for_api(self, stats):
+        """将统计数据格式化为字符串，用于API调用"""
+        # 提取关键统计数据
+        key_stats = {
+            "直播间状态": {
+                "当前在线用户": stats['current_users'],
+                "游客比例": f"{round(stats['guest_users'] / stats['current_users'] * 100 if stats['current_users'] else 0, 1)}%",
+                "注册用户比例": f"{round(stats['registered_users'] / stats['current_users'] * 100 if stats['current_users'] else 0, 1)}%",
+                "流量变化率": f"{round(stats['traffic_rate'], 1)}/分钟",
+                "老客户占比": f"{stats['old_customer_ratio']}%",
+                "长时间停留比例": f"{stats['long_stay_ratio']}%"
+            },
+            "互动情况": {
+                "点赞数": stats['total_likes'],
+                "分享数": stats['total_shares'],
+                "评论数": stats['total_comments'],
+                "热门评论": [comment['content'] for comment in stats.get('top_comments', [])[:2]]
+            },
+            "用户画像": {
+                "男女比例": f"男:{stats.get('male_percentage', 0)}% 女:{stats.get('female_percentage', 0)}%",
+                "平均年龄": stats.get('average_age', '未知'),
+                "主要会员等级": stats.get('top_member_level', '未知'),
+                "平均消费": stats.get('average_spending', 0),
+                "品类偏好": stats.get('top_category_preference', '未知'),
+                "主要生活方式": stats.get('top_lifestyle_inference', '未知'),
+                "主要需求": stats.get('top_demand_identification', '未知'),
+                "主要性格特征": stats.get('top_personality_analysis', '未知'),
+                "购买决策模式": stats.get('top_purchase_decision_pattern', '未知'),
+                "价格承受度": stats.get('top_price_tolerance_level', '未知')
+            },
+            "用户兴趣": dict(list(stats.get('user_interests', {}).items())[:3])
+        }
+        
+        # 将字典转换为格式化字符串
+        formatted = "【直播间实时数据】\n"
+        
+        for section, data in key_stats.items():
+            formatted += f"\n{section}:\n"
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    formatted += f"- {k}: {v}\n"
+            else:
+                formatted += f"- {data}\n"
+        
+        return formatted
 
 @app.route('/api/set-script-id', methods=['POST'])
 def set_script_id():
@@ -1674,6 +1731,95 @@ def get_script():
             'message': str(e)
         }), 500
 
+@app.route('/api/ask-question', methods=['POST'])
+def ask_question():
+    """处理用户问题并返回流式响应"""
+    try:
+        data = request.json
+        question = data.get('question', '')
+        
+        if not question:
+            return jsonify({'error': 'Question is required'}), 400
+        
+        # 生成唯一的流ID
+        stream_id = str(uuid.uuid4())
+        stats = live_room_stats.get_stats()
+        stats_summary = live_room_stats._format_stats_for_api(stats)
+
+        # 启动异步任务处理流式响应
+        def generate_response():
+            try:
+                # 调用DashScope API
+                response = Application.call(
+                    api_key="sk-5825867b9f004646a7dd9aefd5623aaf",
+                    app_id='eacfbfcd378c4306bd475b111bc63884',
+                    prompt=f"{stats_summary}\n{question}",
+                    incremental_output=True,
+                    flow_stream_mode="agent_format",
+                    stream=True
+                )
+                
+                # 直接迭代生成器对象
+                for chunk in response:
+                    if chunk.status_code == HTTPStatus.OK:
+                        event_data = {
+                            "type": "question_response",
+                            "stream_id": stream_id,
+                            "data": chunk.output.text,
+                            "question": question,
+                            "is_end": False
+                        }
+                        sse_message = f"event: question_response\ndata: {json.dumps(event_data)}\n\n"
+                        announcer.announce(sse_message)
+                    else:
+                        app.logger.error(f"API Error: {chunk.message}")
+                
+                # 发送结束标记
+                event_data = {
+                    "type": "question_response",
+                    "stream_id": stream_id,
+                    "data": "",
+                    "question": question,
+                    "is_end": True
+                }
+                sse_message = f"event: question_response\ndata: {json.dumps(event_data)}\n\n"
+                announcer.announce(sse_message)
+            
+            except Exception as e:
+                app.logger.error(f"Error in question response: {str(e)}")
+                error_data = {
+                    "type": "question_response",
+                    "stream_id": stream_id,
+                    "error": True,
+                    "message": f"Error: {str(e)}",
+                    "is_end": True
+                }
+                sse_message = f"event: question_response\ndata: {json.dumps(error_data)}\n\n"
+                announcer.announce(sse_message)
+        
+        # 启动异步任务
+        executor.submit(generate_response)
+        
+        # 立即返回流ID
+        return jsonify({
+            'status': 'success',
+            'message': 'Processing question',
+            'stream_id': stream_id
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Error processing question: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/update-recommendation', methods=['POST'])
+def update_recommendation():
+    data = request.json
+    recommendation = data.get('recommendation', '')
+    
+    # 将推荐字符串存储到 LiveRoomStats 实例中
+    live_room_stats.update_recommendation(recommendation)
+    
+    return jsonify({'status': 'success', 'message': 'Recommendation updated'})
 
 
 if __name__ == '__main__':
