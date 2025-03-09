@@ -16,11 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from collections import Counter, defaultdict
 from dashscope import Application
+import math
 from http import HTTPStatus
 
 app = Flask(__name__)
 CORS(app)
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=10)
 
 # 数据库配置
 DB_CONFIG = {
@@ -119,6 +120,9 @@ def stream():
 # 直播间统计类
 class LiveRoomStats:
     def __init__(self):
+        self.reply_lock = Lock()
+        self.reply_in_progress = False
+
         self.lock = Lock()
         self.reset_stats()
         # 添加script_id属性，默认值为42
@@ -414,310 +418,327 @@ class LiveRoomStats:
                 with conn.cursor() as cursor:
                     # 执行你提供的SQL查询
                     cursor.execute("""
-                    WITH current_users AS (
+                        WITH RECURSIVE current_users AS (
                         SELECT
                             e.user_id 
                         FROM
                             bailian_data_liveinteractions e 
                         WHERE
                             e.behavior_type = 'enter' 
-                            AND NOT EXISTS (SELECT 1 FROM bailian_data_liveinteractions ex WHERE ex.user_id = e.user_id AND ex.behavior_type = 'exit' AND ex.event_time > e.event_time) 
+                            AND NOT EXISTS (
+                            SELECT
+                                1 
+                            FROM
+                                bailian_data_liveinteractions ex 
+                            WHERE
+                                ex.user_id = e.user_id 
+                                AND ex.behavior_type = 'exit' 
+                                AND ex.event_time > e.event_time 
+                            ) 
                         GROUP BY
-                    e.user_id) SELECT-- 性别比例统计
-                    ROUND(SUM(CASE WHEN gender = '1' THEN 1 ELSE 0 END) / COUNT(*) * 100, 2) AS male_percentage,
-                    ROUND(SUM(CASE WHEN gender = '2' THEN 1 ELSE 0 END) / COUNT(*) * 100, 2) AS female_percentage,-- 平均年龄
-                    ROUND(AVG(age), 2) AS average_age,-- 会员等级分布
-                    (
+                            e.user_id 
+                        ),
+                        split_categories AS (-- 新增：拆分品类偏好的递归CTE
+                        SELECT
+                            u.user_id,
+                            SUBSTRING_INDEX( SUBSTRING_INDEX( u.categoryPreference, '、', n.n ), '、', - 1 ) AS single_category,
+                            n.n 
+                        FROM
+                            bailian_data_userprofiles u
+                            INNER JOIN current_users c ON u.user_id = c.user_id
+                            JOIN ( SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 -- 根据最大可能数扩展
+                            ) n ON CHAR_LENGTH( u.categoryPreference ) - CHAR_LENGTH( REPLACE ( u.categoryPreference, '、', '' ) ) >= n.n - 1 
+                        WHERE
+                            u.categoryPreference IS NOT NULL 
+                        ) SELECT-- 性别比例统计
+                        ROUND( SUM( CASE WHEN gender = '1' THEN 1 ELSE 0 END ) / COUNT( * ) * 100, 2 ) AS male_percentage,
+                        ROUND( SUM( CASE WHEN gender = '2' THEN 1 ELSE 0 END ) / COUNT( * ) * 100, 2 ) AS female_percentage,-- 平均年龄
+                        ROUND( AVG( age ), 2 ) AS average_age,-- 会员等级分布
+                        (
                         SELECT
                             member_level 
                         FROM
                             (
-                                SELECT
-                                    member_level,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    member_level IS NOT NULL 
-                                GROUP BY
-                                    member_level 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_member) AS top_member_level,
-                    (
+                            SELECT
+                                member_level,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                member_level IS NOT NULL 
+                            GROUP BY
+                                member_level 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_member 
+                        ) AS top_member_level,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    member_level,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    member_level IS NOT NULL 
-                                GROUP BY
-                                    member_level 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_member_count) AS top_member_level_count,-- 其他统计指标，以相同方式修改
-                    ROUND(AVG(avg_spending), 2) AS average_spending,
-                    ROUND(AVG(discount_sensitivity), 2) AS average_discount_sensitivity,-- 品类偏好TOP1及数量
-                    (
-                        SELECT
-                            categoryPreference 
-                        FROM
-                            (
-                                SELECT
-                                    categoryPreference,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    categoryPreference IS NOT NULL 
-                                GROUP BY
-                                    categoryPreference 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_category) AS top_category_preference,
-                    (
-                        SELECT
-                            count 
-                        FROM
-                            (
-                                SELECT
-                                    categoryPreference,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    categoryPreference IS NOT NULL 
-                                GROUP BY
-                                    categoryPreference 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_category_count) AS top_category_preference_count,-- 评论情感倾向TOP1及数量
-                    (
+                            SELECT
+                                member_level,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                member_level IS NOT NULL 
+                            GROUP BY
+                                member_level 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_member_count 
+                        ) AS top_member_level_count,-- 其他统计指标，以相同方式修改
+                        ROUND( AVG( avg_spending ), 2 ) AS average_spending,
+                        ROUND( AVG( discount_sensitivity ), 2 ) AS average_discount_sensitivity,-- 品类偏好TOP1及数量
+                        ( SELECT single_category FROM ( SELECT single_category, COUNT( * ) AS count FROM split_categories GROUP BY single_category ORDER BY count DESC LIMIT 1 ) t ) AS top_category_preference,
+                        ( SELECT count FROM ( SELECT single_category, COUNT( * ) AS count FROM split_categories GROUP BY single_category ORDER BY count DESC LIMIT 1 ) t ) AS top_category_preference_count,
+                        (
                         SELECT
                             commentSentiment 
                         FROM
                             (
-                                SELECT
-                                    commentSentiment,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    commentSentiment IS NOT NULL 
-                                GROUP BY
-                                    commentSentiment 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_sentiment) AS top_comment_sentiment,
-                    (
+                            SELECT
+                                commentSentiment,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                commentSentiment IS NOT NULL 
+                            GROUP BY
+                                commentSentiment 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_sentiment 
+                        ) AS top_comment_sentiment,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    commentSentiment,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    commentSentiment IS NOT NULL 
-                                GROUP BY
-                                    commentSentiment 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_sentiment_count) AS top_comment_sentiment_count,-- 生活方式推断TOP1及数量
-                    (
+                            SELECT
+                                commentSentiment,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                commentSentiment IS NOT NULL 
+                            GROUP BY
+                                commentSentiment 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_sentiment_count 
+                        ) AS top_comment_sentiment_count,-- 生活方式推断TOP1及数量
+                        (
                         SELECT
                             lifestyleInference 
                         FROM
                             (
-                                SELECT
-                                    lifestyleInference,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    lifestyleInference IS NOT NULL 
-                                GROUP BY
-                                    lifestyleInference 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_lifestyle) AS top_lifestyle_inference,
-                    (
+                            SELECT
+                                lifestyleInference,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                lifestyleInference IS NOT NULL 
+                            GROUP BY
+                                lifestyleInference 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_lifestyle 
+                        ) AS top_lifestyle_inference,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    lifestyleInference,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    lifestyleInference IS NOT NULL 
-                                GROUP BY
-                                    lifestyleInference 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_lifestyle_count) AS top_lifestyle_inference_count,-- 需求识别TOP1及数量
-                    (
+                            SELECT
+                                lifestyleInference,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                lifestyleInference IS NOT NULL 
+                            GROUP BY
+                                lifestyleInference 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_lifestyle_count 
+                        ) AS top_lifestyle_inference_count,-- 需求识别TOP1及数量
+                        (
                         SELECT
                             demandIdentification 
                         FROM
                             (
-                                SELECT
-                                    demandIdentification,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    demandIdentification IS NOT NULL 
-                                GROUP BY
-                                    demandIdentification 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_demand) AS top_demand_identification,
-                    (
+                            SELECT
+                                demandIdentification,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                demandIdentification IS NOT NULL 
+                            GROUP BY
+                                demandIdentification 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_demand 
+                        ) AS top_demand_identification,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    demandIdentification,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    demandIdentification IS NOT NULL 
-                                GROUP BY
-                                    demandIdentification 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_demand_count) AS top_demand_identification_count,-- 性格特征分析TOP1及数量
-                    (
+                            SELECT
+                                demandIdentification,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                demandIdentification IS NOT NULL 
+                            GROUP BY
+                                demandIdentification 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_demand_count 
+                        ) AS top_demand_identification_count,-- 性格特征分析TOP1及数量
+                        (
                         SELECT
                             personalityAnalysis 
                         FROM
                             (
-                                SELECT
-                                    personalityAnalysis,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    personalityAnalysis IS NOT NULL 
-                                GROUP BY
-                                    personalityAnalysis 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_personality) AS top_personality_analysis,
-                    (
+                            SELECT
+                                personalityAnalysis,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                personalityAnalysis IS NOT NULL 
+                            GROUP BY
+                                personalityAnalysis 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_personality 
+                        ) AS top_personality_analysis,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    personalityAnalysis,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    personalityAnalysis IS NOT NULL 
-                                GROUP BY
-                                    personalityAnalysis 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_personality_count) AS top_personality_analysis_count,-- 购买决策模式TOP1及数量
-                    (
+                            SELECT
+                                personalityAnalysis,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                personalityAnalysis IS NOT NULL 
+                            GROUP BY
+                                personalityAnalysis 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_personality_count 
+                        ) AS top_personality_analysis_count,-- 购买决策模式TOP1及数量
+                        (
                         SELECT
                             purchaseDecisionPattern 
                         FROM
                             (
-                                SELECT
-                                    purchaseDecisionPattern,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    purchaseDecisionPattern IS NOT NULL 
-                                GROUP BY
-                                    purchaseDecisionPattern 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_purchase) AS top_purchase_decision_pattern,
-                    (
+                            SELECT
+                                purchaseDecisionPattern,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                purchaseDecisionPattern IS NOT NULL 
+                            GROUP BY
+                                purchaseDecisionPattern 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_purchase 
+                        ) AS top_purchase_decision_pattern,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    purchaseDecisionPattern,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    purchaseDecisionPattern IS NOT NULL 
-                                GROUP BY
-                                    purchaseDecisionPattern 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_purchase_count) AS top_purchase_decision_pattern_count,-- 价格承受度预测TOP1及数量
-                    (
+                            SELECT
+                                purchaseDecisionPattern,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                purchaseDecisionPattern IS NOT NULL 
+                            GROUP BY
+                                purchaseDecisionPattern 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_purchase_count 
+                        ) AS top_purchase_decision_pattern_count,-- 价格承受度预测TOP1及数量
+                        (
                         SELECT
                             priceToleranceLevel 
                         FROM
                             (
-                                SELECT
-                                    priceToleranceLevel,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    priceToleranceLevel IS NOT NULL 
-                                GROUP BY
-                                    priceToleranceLevel 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_price) AS top_price_tolerance_level,
-                    (
+                            SELECT
+                                priceToleranceLevel,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                priceToleranceLevel IS NOT NULL 
+                            GROUP BY
+                                priceToleranceLevel 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_price 
+                        ) AS top_price_tolerance_level,
+                        (
                         SELECT
                             count 
                         FROM
                             (
-                                SELECT
-                                    priceToleranceLevel,
-                                    COUNT(*) AS count 
-                                FROM
-                                    bailian_data_userprofiles u
-                                    INNER JOIN current_users c ON u.user_id = c.user_id 
-                                WHERE
-                                    priceToleranceLevel IS NOT NULL 
-                                GROUP BY
-                                    priceToleranceLevel 
-                                ORDER BY
-                                    count DESC 
-                            LIMIT 1) AS top_price_count) AS top_price_tolerance_level_count 
-                    FROM
+                            SELECT
+                                priceToleranceLevel,
+                                COUNT( * ) AS count 
+                            FROM
+                                bailian_data_userprofiles u
+                                INNER JOIN current_users c ON u.user_id = c.user_id 
+                            WHERE
+                                priceToleranceLevel IS NOT NULL 
+                            GROUP BY
+                                priceToleranceLevel 
+                            ORDER BY
+                                count DESC 
+                                LIMIT 1 
+                            ) AS top_price_count 
+                        ) AS top_price_tolerance_level_count 
+                        FROM
                         bailian_data_userprofiles u
                         INNER JOIN current_users c ON u.user_id = c.user_id;
                     """)
@@ -785,7 +806,8 @@ class LiveRoomStats:
                     conn.close()
             
             # 生成话术推荐
-            stats['script_recommendations'] = self._generate_recommendations(stats)
+            if batch_control['running']:
+                stats['script_recommendations'] = self._generate_recommendations(stats)
             
             return stats
     
@@ -795,7 +817,7 @@ class LiveRoomStats:
         
         # 将关键统计数据转换为字符串格式
         stats_summary = self._format_stats_for_api(stats)
-        
+
         # 根据用户构成推荐
         if stats['guest_users'] > stats['registered_users'] * 2:
             rec = "游客占比高，建议增加品牌介绍和会员福利引导"
@@ -1015,7 +1037,7 @@ def get_alert_conditions():
         alerts.append({
             'type': 'vip_presence',
             'severity': 'high',
-            'message': f"当前有{vip_count}位高消费用户在线"
+            'message': f"当前有{vip_count}位VIP专属客户在线，请引导至VIP专属直播间并提供专属服务！"
         })
     
     # 检测用户停留情况
@@ -1029,7 +1051,7 @@ def get_alert_conditions():
     return jsonify({
         'alerts': alerts,
         'timestamp': datetime.now().isoformat(),
-        'recommendations': stats['script_recommendations']
+        'recommendations': stats.get('script_recommendations', [])
     })
 
 # 初始化直播间统计实例
@@ -1044,12 +1066,53 @@ class InteractionTracker:
     def __init__(self):
         self.tracker = {}
         self.comments = [
+            # 原有评论
             "这个价格还能再低吗？", "有没有满减活动？", "和上次直播比贵了呀",
             "165cm穿什么码？", "北方现在穿会冷吗？", "机洗会掉色吗？",
             "库存只剩3件了！", "求补XXL码！", "什么时候补货？",
             "已拍2件！", "帮朋友带一件", "下单了改地址可以吗？",
             "主播试下M码效果", "左边款有没有其他颜色？", "能不能再演示下功能？",
-            "主播声音好好听！", "关注了每周都来", "明天还播吗？"
+            "主播声音好好听！", "关注了每周都来", "明天还播吗？",
+
+            # 价格与优惠
+            "这款是限量版吗？价格确实高但值！", 
+            "奢侈品不打折正常，不过能送点小礼品吗？", 
+            "会员价是多少？非会员买不划算吧？", 
+            "直播间专属优惠力度太小了，建议加大！", 
+
+            # 产品细节
+            "这款包包的五金件是镀金还是纯金？", 
+            "皮革是意大利进口的吗？摸起来质感如何？", 
+            "手表的防水性能怎么样？日常洗手没问题吧？", 
+            "这款丝巾的图案设计灵感是什么？好特别！", 
+            "香水的前调中调后调分别是什么？留香时间长吗？", 
+
+            # 购买决策
+            "犹豫了好久，终于决定入手了！", 
+            "这款经典款值得投资，买了不会后悔！", 
+            "想等年底大促再看看，但怕断货！", 
+            "朋友推荐我买的，说质量真的好！", 
+            "第一次买奢侈品，主播推荐哪款适合新手？", 
+
+            # 用户体验
+            "收到货包装太精美了，拆开像在过生日！", 
+            "售后服务真的很贴心，有问题随时解决！", 
+            "物流速度超快，昨天下的单今天就到了！", 
+            "退换货方便吗？如果尺寸不合适怎么办？", 
+            "主播讲解很专业，听得出来懂行！", 
+
+            # 品牌价值与情感共鸣
+            "这个品牌的设计一直很吸引我，终于等到直播了！", 
+            "每一件都是艺术品，买它就是买身份象征！", 
+            "支持国货奢侈品牌，期待更多创新！", 
+            "主播气质和品牌太搭了，越看越喜欢！", 
+            "奢侈品不仅仅是商品，更是一种生活态度！", 
+
+            # 其他互动
+            "这款和其他品牌的同款相比，哪个更好？", 
+            "能详细讲讲保养方法吗？比如皮具护理？", 
+            "主播能不能分享一下自己的搭配心得？", 
+            "下次直播会有新品发布吗？提前预告一下！"
         ]
         self.lock = Lock()
 
@@ -1123,7 +1186,7 @@ def generate_interaction():
         user_id = random.choice(active_users)
         behavior = random.choices(
             ['exit', 'like', 'comment', 'share'],
-            weights=[10, 50, 30, 10]
+            weights=[10, 30, 50, 10]
         )[0]
     else:
         behavior = 'enter'
@@ -1821,6 +1884,82 @@ def update_recommendation():
     
     return jsonify({'status': 'success', 'message': 'Recommendation updated'})
 
+@app.route('/api/reply-comment', methods=['POST'])
+def reply_comment():
+    """处理客户评论并返回流式回复"""
+    try:
+        with live_room_stats.reply_lock:
+            if live_room_stats.reply_in_progress:
+                return jsonify({'error': '前一个回复正在处理中'}), 429
+            live_room_stats.reply_in_progress = True
+
+        data = request.json
+        comment = data.get('comment', '')
+        
+        if not comment:
+            return jsonify({'error': 'Comment is required'}), 400
+        
+        # 生成唯一的流ID
+        stream_id = str(uuid.uuid4())
+
+        # 启动异步任务处理流式响应
+        def generate_response():
+            try:
+                response = Application.call(
+                    api_key="sk-5825867b9f004646a7dd9aefd5623aaf",
+                    app_id='0808ee60201f48779dae67abec6f7261',  # 新的应用ID
+                    prompt=comment,  # 直接使用用户评论作为prompt
+                    incremental_output=True,
+                    flow_stream_mode="agent_format",
+                    stream=True
+                )
+                
+                for chunk in response:
+                    if chunk.status_code == HTTPStatus.OK:
+                        event_data = {
+                            "type": "comment_reply",
+                            "stream_id": stream_id,
+                            "data": chunk.output.text,
+                            "comment": comment,
+                            "is_end": False
+                        }
+                        sse_message = f"event: comment_reply\ndata: {json.dumps(event_data)}\n\n"
+                        announcer.announce(sse_message)
+                
+                # 发送结束标记
+                event_data = {
+                    "type": "comment_reply",
+                    "stream_id": stream_id,
+                    "data": "",
+                    "comment": comment,
+                    "is_end": True
+                }
+                sse_message = f"event: comment_reply\ndata: {json.dumps(event_data)}\n\n"
+                announcer.announce(sse_message)
+            
+            except Exception as e:
+                error_data = {
+                    "type": "comment_reply",
+                    "stream_id": stream_id,
+                    "error": True,
+                    "message": f"Error: {str(e)}",
+                    "is_end": True
+                }
+                sse_message = f"event: comment_reply\ndata: {json.dumps(error_data)}\n\n"
+                announcer.announce(sse_message)
+        
+        executor.submit(generate_response)
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Processing comment',
+            'stream_id': stream_id
+        })   
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        with live_room_stats.reply_lock:
+            live_room_stats.reply_in_progress = False
 
 if __name__ == '__main__':
 

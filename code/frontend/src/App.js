@@ -55,7 +55,7 @@ const LiveStreamPage = () => {
     top_price_tolerance_level_count: 0
   });
   const [alerts, setAlerts] = useState([]);
-  const [scriptId, setScriptId] = useState(42); // 默认值为42
+  const [scriptId, setScriptId] = useState(43); // 默认值为42
   const [aiResponses, setAiResponses] = useState({}); // 存储AI返回的话术
   const messagesContainerRef = useRef(null);
   const eventSourceRef = useRef(null);
@@ -69,6 +69,11 @@ const LiveStreamPage = () => {
   const questionResponsesContainerRef = useRef(null);
   const [selectedPhase, setSelectedPhase] = useState("开场话术"); // 默认选中“开场话术”
   const [selectedTags, setSelectedTags] = useState([]); // 存储选中的标签
+  const alertsIntervalRef = useRef(null);
+  const [comment, setComment] = useState('');
+  const [commentResponses, setCommentResponses] = useState({});
+  const [isCommentSubmitting, setIsCommentSubmitting] = useState(false);
+  const commentResponsesContainerRef = useRef(null);
 
   // 更新话术阶段的函数
   const handlePhaseClick = (phase) => {
@@ -194,16 +199,46 @@ const LiveStreamPage = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action,
-          interval: 1,
+          interval: 0.3,
           count: action === 'start' ? 999999 : 0
         }),
       });
+      
+      // 控制警报请求的interval
+      if (action === 'start') {
+        alertsIntervalRef.current = setInterval(() => {
+          fetch(`${API_BASE_URL}/alert-conditions`)
+            .then(res => res.json())
+            .then(data => setAlerts(data.alerts))
+            .catch(console.error);
+        }, 2000);
+      } else {
+        clearInterval(alertsIntervalRef.current);
+        alertsIntervalRef.current = null;
+      }
+      
       setIsBatchRunning(action === 'start');
     } catch (error) {
       console.error('Batch control error:', error);
     }
   };
   
+  useEffect(() => {
+    // 组件加载时启动告警轮询
+    alertsIntervalRef.current = setInterval(() => {
+      fetch(`${API_BASE_URL}/alert-conditions`)
+        .then(res => res.json())
+        .then(data => setAlerts(data.alerts))
+        .catch(console.error);
+    }, 2000);
+  
+    // 组件卸载时清除
+    return () => {
+      clearInterval(alertsIntervalRef.current);
+      alertsIntervalRef.current = null;
+    };
+  }, []);
+
   useEffect(() => {
     sendRecommendationToBackend(selectedPhase, selectedTags);
   }, [selectedPhase, selectedTags]); // 当这两个状态变化时触发
@@ -353,6 +388,37 @@ const LiveStreamPage = () => {
       }
     });
     
+    eventSourceRef.current.addEventListener('comment_reply', (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        const streamId = data.stream_id;
+        
+        setCommentResponses(prev => {
+          const existing = prev[streamId] || { 
+            text: '', 
+            comment: data.comment,
+            complete: false,
+            streamId: streamId,
+            error: data.error,
+            errorMessage: data.message
+          };
+          
+          return {
+            ...prev,
+            [streamId]: {
+              ...existing,
+              text: data.is_end ? existing.text : existing.text + (data.data || ''),
+              complete: data.is_end || false,
+              error: data.error,
+              errorMessage: data.message
+            }
+          };
+        });
+      } catch (error) {
+        console.error('Error parsing comment reply data:', error);
+      }
+    });
+
     eventSourceRef.current.addEventListener('question_response', (event) => {
       try {
         const data = JSON.parse(event.data);
@@ -399,20 +465,13 @@ const LiveStreamPage = () => {
         console.error('Error parsing question response data:', error);
       }
     });
-    
-    // 定期获取警报信息
-    const alertsInterval = setInterval(() => {
-      fetch(`${API_BASE_URL}/alert-conditions`)
-        .then(res => res.json())
-        .then(data => {
-          setAlerts(data.alerts);
-        })
-        .catch(err => console.error('Error fetching alerts:', err));
-    }, 2000);
 
     return () => {
       eventSourceRef.current?.close();
-      clearInterval(alertsInterval);
+      // 清理interval
+      if (alertsIntervalRef.current) {
+        clearInterval(alertsIntervalRef.current);
+      }
       
       if (isBatchRunning) {
         fetch(`${API_BASE_URL}/batch-control`, {
@@ -422,6 +481,7 @@ const LiveStreamPage = () => {
         });
       }
     };
+
   }, [scriptId, isBatchRunning]); 
 
   useEffect(() => {
@@ -432,7 +492,7 @@ const LiveStreamPage = () => {
 
   // 当scriptId变更时，更新后端设置
   const handleScriptIdChange = (e) => {
-    const newId = parseInt(e.target.value) || 42; // 如果无法解析为整数，则使用默认值42
+    const newId = parseInt(e.target.value) || 43; // 如果无法解析为整数，则使用默认值43
     setScriptId(newId);
     
     // 发送到后端
@@ -546,51 +606,89 @@ const LiveStreamPage = () => {
     ));
   };
   
-// 修改告警渲染函数
-const renderAlerts = () => {
-  if (alerts.length === 0) {
-    return <div className="text-center text-muted py-3">暂无告警信息</div>;
-  }
-  
-  // 单个告警显示模式（轮播）
-  return (
-    <>
-      <div className="alert-carousel">
-        {alerts.map((alert, index) => {
-          let alertClass = "alert ";
-          switch(alert.severity) {
-            case 'high':
-              alertClass += "alert-danger";
-              break;
-            case 'medium':
-              alertClass += "alert-warning";
-              break;
-            case 'positive':
-              alertClass += "alert-success";
-              break;
-            default:
-              alertClass += "alert-info";
-          }
-          
-          return (
-            <div 
-              key={index} 
-              className={`alert-carousel-item ${index === activeAlertIndex ? 'active' : ''}`}
-            >
-              <div className={alertClass}>
-                <strong>{alert.type === 'traffic_change' ? '⚠️ ' : '📊 '}</strong>
-                {alert.message}
+  // 修改告警渲染函数
+  const renderAlerts = () => {
+    if (alerts.length === 0) {
+      return <div className="text-center text-muted py-3">暂无告警信息</div>;
+    }
+    
+    // 单个告警显示模式（轮播）
+    return (
+      <>
+        <div className="alert-carousel">
+          {alerts.map((alert, index) => {
+            let alertClass = "alert ";
+            switch(alert.severity) {
+              case 'high':
+                alertClass += "alert-danger";
+                break;
+              case 'medium':
+                alertClass += "alert-warning";
+                break;
+              case 'positive':
+                alertClass += "alert-success";
+                break;
+              default:
+                alertClass += "alert-info";
+            }
+            
+            return (
+              <div 
+                key={index} 
+                className={`alert-carousel-item ${index === activeAlertIndex ? 'active' : ''}`}
+              >
+                <div className={alertClass}>
+                  <strong>{alert.type === 'traffic_change' ? '⚠️ ' : '📊 '}</strong>
+                  {alert.message}
+                </div>
               </div>
-            </div>
-          );
-        })}
-      </div>
-    </>
-  );
-};
+            );
+          })}
+        </div>
+      </>
+    );
+  };
+
+  const handleCommentSubmit = async (e) => {
+    e.preventDefault();
+    if (!comment.trim() || isCommentSubmitting) return;
+    
+    setIsCommentSubmitting(true);
+    
+    try {
+      const response = await fetch(`${API_BASE_URL}/reply-comment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comment: comment.trim() }),
+      });
+      
+      const data = await response.json();
+      
+      if (data.status === 'success') {
+        setComment('');
+        setCommentResponses(prev => ({
+          ...prev,
+          [data.stream_id]: {
+            text: '',
+            comment: comment.trim(),
+            complete: false,
+            streamId: data.stream_id
+          }
+        }));
+      }
+    } catch (error) {
+      console.error('Error submitting comment:', error);
+    } finally {
+      setIsCommentSubmitting(false);
+    }
+  };
 
   return (
     <div className="main-container container-fluid">
+          
+      <nav class="navbar">
+          <div class="logo">LOUIS VUITTON</div>
+      </nav>
       <div className="row g-0 h-100">
         {/* 左侧面板 - 数据统计 */}
         <div className="side-panel col-lg-4 p-3">
@@ -640,68 +738,53 @@ const renderAlerts = () => {
               ))}
             </div>
           </div>
-            <h4 className="stats-header">直播间实时数据</h4>
-            
-            <div className="user-stats mb-4">
-              <h5>用户统计</h5>
-              <div className="stats-row">
-                <div className="stat-item">
-                  <div className="stat-value">{liveStats.current_users}</div>
-                  <div className="stat-label">当前用户</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-value">{liveStats.guest_users}</div>
-                  <div className="stat-label">游客用户</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-value">{liveStats.registered_users}</div>
-                  <div className="stat-label">注册用户</div>
-                </div>
+
+          <div className="comment-container mb-4">
+            <h4 className="stats-header">重点评论智能回复</h4>
+            <form onSubmit={handleCommentSubmit} className="comment-form">
+              <div className="input-group">
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="请输入需要回复的客户评论..."
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                  disabled={isCommentSubmitting}
+                />
+                <button 
+                  type="submit" 
+                  className="btn btn-primary" 
+                  disabled={isCommentSubmitting || !comment.trim()}
+                >
+                  {isCommentSubmitting ? '发送中...' : '发送'}
+                </button>
               </div>
+            </form>
+            
+            <div className="comment-responses" ref={commentResponsesContainerRef}>
+              {Object.values(commentResponses).map((response, index) => (
+                <div key={response.streamId || index} className="response-item">
+                  <div className="comment-text">
+                    <strong>评论:</strong> {response.comment}
+                  </div>
+                  <div className="reply-text">
+                    {response.error ? (
+                      <div className="error-message">{response.errorMessage || '处理评论时出错'}</div>
+                    ) : (
+                      <>
+                        <ReactMarkdown rehypePlugins={[rehypeRaw]}>
+                          {response.text || ''}
+                        </ReactMarkdown>
+                        {!response.complete && <span className="typing-cursor">|</span>}
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
-            
-            <div className="interaction-stats mb-4">
-              <h5>互动统计</h5>
-              <div className="stats-row">
-                <div className="stat-item">
-                  <div className="stat-value">{liveStats.total_likes}</div>
-                  <div className="stat-label">点赞数</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-value">{liveStats.total_shares}</div>
-                  <div className="stat-label">分享数</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-value">{liveStats.total_comments}</div>
-                  <div className="stat-label">评论数</div>
-                </div>
-              </div>
-            </div>
-            
-            <div className="traffic-chart mb-4">
-              <h5>流量趋势</h5>
-              <div className="chart-container" style={{ height: '200px' }}>
-                <Line data={trafficChartData} options={trafficChartOptions} />
-              </div>
-              <div className="traffic-rate mt-2">
-                <span className={`badge ${liveStats.traffic_rate > 0 ? 'bg-success' : liveStats.traffic_rate < 0 ? 'bg-danger' : 'bg-secondary'}`}>
-                  流量变化率: {liveStats.traffic_rate > 0 ? '+' : ''}{liveStats.traffic_rate.toFixed(2)}/分钟
-                </span>
-              </div>
-            </div>
-            
-            <div className="audience-analysis mb-4">
-              <h5>用户画像分析</h5>
-              <div className="user-tags mb-2">
-                <h6>用户标签:</h6>
-                <div>{renderUserTags()}</div>
-              </div>
-              <div className="user-interests">
-                <h6>用户兴趣:</h6>
-                <div>{renderUserInterests()}</div>
-              </div>
-            </div>
-            
+          </div>
+          <div className="audience-analysis mb-4">
+                      
             <div className="user-profile-stats mb-4">
               <h5>用户画像统计</h5>
               
@@ -819,9 +902,56 @@ const renderAlerts = () => {
               </div>
             </div>
 
-            <div className="top-comments">
-              <h5>热门评论 TOP3</h5>
-              {renderTopComments()}
+              <div className="top-comments">
+                <h5>热门评论 TOP3</h5>
+                {renderTopComments()}
+              </div>
+              <div className="audience-insights mb-4">
+                <h5>用户需求洞察</h5>
+                
+                <div className="insight-item">
+                  <div className="insight-icon">👥</div>
+                  <div className="insight-content">
+                    <h6>用户特征</h6>
+                    <ul className="user-traits">
+                      {liveStats.old_customer_ratio > 50 && (
+                        <li>老客户占比高 ({liveStats.old_customer_ratio}%)</li>
+                      )}
+                      {liveStats.long_stay_ratio > 50 && (
+                        <li>停留时长高 ({liveStats.long_stay_ratio}%超过5分钟)</li>
+                      )}
+                      {Object.entries(liveStats.user_tags || {}).slice(0, 2).map(([tag, count], idx) => (
+                        <li key={idx}>{tag}用户较多 ({count}人)</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+                
+                {/* 新增用户画像洞察 */}
+                <div className="insight-item mt-3">
+                  <div className="insight-icon">📊</div>
+                  <div className="insight-content">
+                    <h6>用户画像洞察</h6>
+                    <ul className="user-traits">
+                      {liveStats.male_percentage > 60 && (
+                        <li>男性用户占主导 ({Math.round(liveStats.male_percentage)}%)</li>
+                      )}
+                      {liveStats.female_percentage > 60 && (
+                        <li>女性用户占主导 ({Math.round(liveStats.female_percentage)}%)</li>
+                      )}
+                      {liveStats.average_age > 0 && (
+                        <li>平均年龄 {liveStats.average_age.toFixed(1)} 岁</li>
+                      )}
+                      {liveStats.top_personality_analysis && (
+                        <li>主要性格特征: {liveStats.top_personality_analysis}</li>
+                      )}
+                      {liveStats.top_demand_identification && (
+                        <li>主要需求: {liveStats.top_demand_identification}</li>
+                      )}
+                    </ul>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -869,15 +999,27 @@ const renderAlerts = () => {
             <div className="live-viewport">
               <div className="player-wrapper">
                 <ReactPlayer
-                  url="https://sf1-cdn-tos.huoshanstatic.com/obj/media-fe/xgplayer_doc_video/hls/xgplayer-demo.m3u8"
+                  url="http://localhost:8080/LV.mp4"
                   playing
                   controls
                   width="100%"
                   height="100%"
-                  style={{ position: 'absolute', top: 0, left: 0 }}
+                  style={{ 
+                    position: 'absolute', 
+                    top: 0, 
+                    left: 0, 
+                    objectFit: 'cover'  // 确保视频覆盖整个容器
+                  }}
                   config={{ 
                     file: { 
-                      forceHLS: true,
+                      attributes: { 
+                        controlsList: "nodownload",
+                        style: { 
+                          width: '100%', 
+                          height: '100%', 
+                          objectFit: 'cover'  // 确保视频覆盖整个容器
+                        }
+                      }
                     } 
                   }}
                 />
@@ -958,7 +1100,7 @@ const renderAlerts = () => {
                 />
                 <span className="input-group-text">当前ID: {scriptId}</span>
               </div>
-              <small className="form-text text-muted">不填写则使用默认模板(ID:42)</small>
+              <small className="form-text text-muted">不填写则使用默认模板(ID:43)</small>
             </div>
             
             <div className="script-recommendations mb-4">
@@ -969,50 +1111,53 @@ const renderAlerts = () => {
               </div>
             </div>
             
-            <div className="audience-insights mb-4">
-              <h5>用户需求洞察</h5>
-              
-              <div className="insight-item">
-                <div className="insight-icon">👥</div>
-                <div className="insight-content">
-                  <h6>用户特征</h6>
-                  <ul className="user-traits">
-                    {liveStats.old_customer_ratio > 50 && (
-                      <li>老客户占比高 ({liveStats.old_customer_ratio}%)</li>
-                    )}
-                    {liveStats.long_stay_ratio > 50 && (
-                      <li>停留时长高 ({liveStats.long_stay_ratio}%超过5分钟)</li>
-                    )}
-                    {Object.entries(liveStats.user_tags || {}).slice(0, 2).map(([tag, count], idx) => (
-                      <li key={idx}>{tag}用户较多 ({count}人)</li>
-                    ))}
-                  </ul>
+            <h4 className="stats-header">直播间实时数据</h4>
+            
+            <div className="user-stats mb-4">
+              <h5>用户统计</h5>
+              <div className="stats-row">
+                <div className="stat-item">
+                  <div className="stat-value">{liveStats.current_users}</div>
+                  <div className="stat-label">当前用户</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-value">{liveStats.guest_users}</div>
+                  <div className="stat-label">游客用户</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-value">{liveStats.registered_users}</div>
+                  <div className="stat-label">注册用户</div>
                 </div>
               </div>
-              
-              {/* 新增用户画像洞察 */}
-              <div className="insight-item mt-3">
-                <div className="insight-icon">📊</div>
-                <div className="insight-content">
-                  <h6>用户画像洞察</h6>
-                  <ul className="user-traits">
-                    {liveStats.male_percentage > 60 && (
-                      <li>男性用户占主导 ({Math.round(liveStats.male_percentage)}%)</li>
-                    )}
-                    {liveStats.female_percentage > 60 && (
-                      <li>女性用户占主导 ({Math.round(liveStats.female_percentage)}%)</li>
-                    )}
-                    {liveStats.average_age > 0 && (
-                      <li>平均年龄 {liveStats.average_age.toFixed(1)} 岁</li>
-                    )}
-                    {liveStats.top_personality_analysis && (
-                      <li>主要性格特征: {liveStats.top_personality_analysis}</li>
-                    )}
-                    {liveStats.top_demand_identification && (
-                      <li>主要需求: {liveStats.top_demand_identification}</li>
-                    )}
-                  </ul>
+            </div>
+            
+            <div className="interaction-stats mb-4">
+              <h5>互动统计</h5>
+              <div className="stats-row">
+                <div className="stat-item">
+                  <div className="stat-value">{liveStats.total_likes}</div>
+                  <div className="stat-label">点赞数</div>
                 </div>
+                <div className="stat-item">
+                  <div className="stat-value">{liveStats.total_shares}</div>
+                  <div className="stat-label">分享数</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-value">{liveStats.total_comments}</div>
+                  <div className="stat-label">评论数</div>
+                </div>
+              </div>
+            </div>
+            
+            <div className="traffic-chart mb-4">
+              <h5>流量趋势</h5>
+              <div className="chart-container" style={{ height: '200px' }}>
+                <Line data={trafficChartData} options={trafficChartOptions} />
+              </div>
+              <div className="traffic-rate mt-2">
+                <span className={`badge ${liveStats.traffic_rate > 0 ? 'bg-success' : liveStats.traffic_rate < 0 ? 'bg-danger' : 'bg-secondary'}`}>
+                  流量变化率: {liveStats.traffic_rate > 0 ? '+' : ''}{liveStats.traffic_rate.toFixed(2)}/分钟
+                </span>
               </div>
             </div>
             
