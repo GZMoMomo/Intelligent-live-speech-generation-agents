@@ -922,7 +922,7 @@ class DataProcessor:
         
     def _load_data(self):
         """数据加载"""
-        excel_path = os.path.join(os.path.dirname(__file__), "Bailian_Data Sample_LV_20241212.xlsx")
+        excel_path = os.path.join(os.path.dirname(__file__), "Bailian_Data_Sample_LV_20241212.xlsx")
         self.orders = pd.read_excel(excel_path, sheet_name=0)
         self.customers = pd.read_excel(excel_path, sheet_name=1)
         self.products = pd.read_excel(excel_path, sheet_name=2)
