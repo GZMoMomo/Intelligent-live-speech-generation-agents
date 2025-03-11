@@ -11,7 +11,8 @@ import rehypeRaw from 'rehype-raw'; // 用于支持HTML渲染
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend);
 
 const MAX_MESSAGES = 8; // 最多显示8条消息
-const API_BASE_URL = 'http://localhost:5000/api';
+const API_BASE_URL = 'http://backend:5000/api';
+// const API_BASE_URL = 'http://localhost:5000/api';
 
 const LiveStreamPage = () => {
   const [messages, setMessages] = useState([]);
